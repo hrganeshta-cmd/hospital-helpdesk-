@@ -1,0 +1,4 @@
+[deploy]
+startCommand = "python app.py"
+healthcheckPath = "/api/health"
+healthcheckTimeout = 60
