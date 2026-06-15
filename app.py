@@ -112,8 +112,6 @@ def session_end():
 
 
 if __name__ == "__main__":
-    # For production on Windows Server, run behind waitress:
-    #   pip install waitress
-    #   waitress-serve --listen=0.0.0.0:8000 app:app
+    from waitress import serve
     port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    serve(app, host="0.0.0.0", port=port)
