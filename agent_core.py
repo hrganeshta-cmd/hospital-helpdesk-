@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import sys
+import traceback
 import requests
 from openai import OpenAI
 from bs4 import BeautifulSoup
@@ -14,6 +16,27 @@ import uuid
 # On Windows Server (PowerShell):  $env:OPENAI_API_KEY = "sk-..."
 # Or set it permanently in System Properties > Environment Variables.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+# ---------------------------------------------------------------------------
+# 1b. HOSPITAL SETTINGS
+#     Everything specific to one hospital (name, address, phone, booking ID
+#     prefix) lives in hospital_settings.json, so the same code can be
+#     installed at another hospital by editing only that file.
+#     HOSPITAL_SETTINGS_PATH may point to a different file.
+# ---------------------------------------------------------------------------
+SETTINGS_PATH = os.environ.get("HOSPITAL_SETTINGS_PATH",
+                               os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "hospital_settings.json"))
+
+with open(SETTINGS_PATH, encoding="utf-8") as _f:
+    HOSPITAL_SETTINGS = json.load(_f)
+
+HOSPITAL_NAME     = HOSPITAL_SETTINGS["hospital_name"]
+RECEPTIONIST_NAME = HOSPITAL_SETTINGS["receptionist_name"]
+BOOKING_ID_PREFIX = HOSPITAL_SETTINGS["booking_id_prefix"]
+APPOINTMENT_PHONE = HOSPITAL_SETTINGS["appointment_phone"]
+LOCATION_ANSWER   = HOSPITAL_SETTINGS["location_answer"]
+BOOKING_ID_FORMAT = f"{BOOKING_ID_PREFIX}-YYYYMMDD-XXXXX"
 
 # ---------------------------------------------------------------------------
 # 2. MOCK PATIENT DATABASE
@@ -535,7 +558,7 @@ def book_appointment(patient_name: str, phone_number: str, date_str: str,
             )
 
     # 6. Generate booking ID and persist
-    booking_id = f"SUH-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
+    booking_id = f"{BOOKING_ID_PREFIX}-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
     new_appointment = {
         "booking_id":      booking_id,
         "patient_name":    patient_name,
@@ -714,73 +737,73 @@ def list_available_slots(doctor_name: str, date_str: str) -> str:
 # ---------------------------------------------------------------------------
 # 9. HOSPITAL FAQ KNOWLEDGE BASE
 # ---------------------------------------------------------------------------
-hospital_faqs = """
-Based on the provided FAQ document for Symbiosis University Hospital, here are the questions and answers arranged in English, Hindi, and Marathi:
+hospital_faqs = f"""
+Based on the provided FAQ document for the hospital, here are the questions and answers arranged in English, Hindi, and Marathi:
 1.	Hospital Location
-o	English Q: Where is Symbiosis Hospital located?
-	A: Welcome to Symbiosis Hospital. We are located in Lavale, Pune, accessible via the Pashan - Sus Road.
-o	Hindi Q: सिम्बायोसिस हॉस्पिटल कहाँ स्थित है?
-	A: सिम्बायोसिस हॉस्पिटल में आपका स्वागत है। हम लवले, पुणे में स्थित हैं, यहाँ पाषाण-सूस रोड के माध्यम से पहुँचा जा सकता है।
-o	Marathi Q: सिम्बायोसिस हॉस्पिटल कोठे आहे?
-	A: सिम्बायोसिस हॉस्पिटलमध्ये आपले स्वागत आहे. आमचे रुग्णालय लवळे, पुणे येथे असून पाषाण-सूस रोडने येथे पोहोचता येते.
+o	English Q: Where is the Hospital located?
+	A: {LOCATION_ANSWER['en']}
+o	Hindi Q: हॉस्पिटल कहाँ स्थित है?
+	A: {LOCATION_ANSWER['hi']}
+o	Marathi Q: हॉस्पिटल कोठे आहे?
+	A: {LOCATION_ANSWER['mr']}
 2.	OPD Timings
 o	English Q: What are the OPD timings?
-	A: Welcome to Symbiosis Hospital. Our OPD services are available from 8:30 am to 5:00 pm.
+	A: Our OPD services are available from 8:30 am to 5:00 pm.
 o	Hindi Q: ओपीडी (OPD) का समय क्या है?
-	A: सिम्बायोसिस हॉस्पिटल में आपका स्वागत है। हमारी ओपीडी सेवाएं सुबह 8:30 बजे से शाम 5:00 बजे तक उपलब्ध हैं।
+	A: हमारी ओपीडी सेवाएं सुबह 8:30 बजे से शाम 5:00 बजे तक उपलब्ध हैं।
 o	Marathi Q: ओपीडी (OPD) ची वेळ काय आहे?
-	A: सिम्बायोसिस हॉस्पिटलमध्ये आपले स्वागत आहे. आमची ओपीडी सेवा सकाळी ८:३० ते संध्याकाळी ५:०० वाजेपर्यंत सुरू असते.
+	A: आमची ओपीडी सेवा सकाळी ८:३० ते संध्याकाळी ५:०० वाजेपर्यंत सुरू असते.
 3.	Government Health Schemes
 o	English Q: Do you support Government health schemes?
-	A: Welcome to Symbiosis Hospital. Yes, we support all major Government Schemes (like MPJAY/PMJAY) and have dedicated registration counters for them.
+	A: Yes, we support all major Government Schemes (like MPJAY/PMJAY) and have dedicated registration counters for them.
 o	Hindi Q: क्या यहाँ आयुष्मान भारत योजना चलती है?
-	A: सिम्बायोसिस हॉस्पिटल में आपका स्वागत है। जी हाँ, यहाँ PMJAY और सभी प्रमुख सरकारी योजनाएं मान्य हैं।
+	A: जी हाँ, यहाँ PMJAY और सभी प्रमुख सरकारी योजनाएं मान्य हैं।
 o	Marathi Q: सरकारी योजना लागू आहेत का?
-	A: सिम्बायोसिस हॉस्पिटलमध्ये आपले स्वागत आहे. होय, येथे MPJAY आणि सर्व प्रमुख सरकारी योजना लागू आहेत; त्यासाठी स्वतंत्र खिडक्या उपलब्ध आहेत.
+	A: होय, येथे MPJAY आणि सर्व प्रमुख सरकारी योजना लागू आहेत; त्यासाठी स्वतंत्र खिडक्या उपलब्ध आहेत.
 4.	Appointment Booking
 o	English Q: How can I book an appointment?
-	A: Welcome to Symbiosis Hospital. Paid patients can book appointments in advance telephonically at +91 9226470807.
+	A: Paid patients can book appointments in advance telephonically at {APPOINTMENT_PHONE}.
 o	Hindi Q: क्या एडवांस अपॉइंटमेंट ले सकते हैं?
-	A: सिम्बायोसिस हॉस्पिटल में आपका स्वागत है। जी हाँ, आप +91 9226470807 पर कॉल करके अपॉइंटमेंट बुक कर सकते हैं।
+	A: जी हाँ, आप {APPOINTMENT_PHONE} पर कॉल करके अपॉइंटमेंट बुक कर सकते हैं।
 o	Marathi Q: अपॉइंटमेंट फोनवर बुक करता येते का?
-	A: सिम्बायोसिस हॉस्पिटलमध्ये आपले स्वागत आहे. होय, सशुल्क रुग्ण +91 9226470807 वर संपर्क करून आगाऊ वेळ घेऊ शकतात.
+	A: होय, सशुल्क रुग्ण {APPOINTMENT_PHONE} वर संपर्क करून आगाऊ वेळ घेऊ शकतात.
 5.	Cashless Treatment
 o	English Q: Do you offer cashless treatment?
-	A: Welcome to Symbiosis Hospital. Yes, we have all major TPAs registered for cashless insurance processing.
+	A: Yes, we have all major TPAs registered for cashless insurance processing.
 o	Hindi Q: क्या कैशलेस इलाज की सुविधा है?
-	A: सिम्बायोसिस हॉस्पिटल में आपका स्वागत है। जी हाँ, हमारे पास सभी प्रमुख टीपीए (TPA) पंजीकृत हैं।
+	A: जी हाँ, हमारे पास सभी प्रमुख टीपीए (TPA) पंजीकृत हैं।
 o	Marathi Q: कॅशलेस सुविधा उपलब्ध आहे का?
-	A: सिम्बायोसिस हॉस्पिटलमध्ये आपले स्वागत आहे. होय, आमच्याकडे सर्व प्रमुख टीपीए (TPA) नोंदणीकृत असून कॅशलेस उपचार मिळतात.
+	A: होय, आमच्याकडे सर्व प्रमुख टीपीए (TPA) नोंदणीकृत असून कॅशलेस उपचार मिळतात.
 6.	Key Specialties
 o	English Q: Which key specialties are available?
-	A: Welcome to Symbiosis Hospital. We offer major specialties, including Cardiology, Oncology, and Neurology.
+	A: We offer major specialties, including Cardiology, Oncology, and Neurology.
 o	Hindi Q: क्या यहाँ हृदय रोग का इलाज होता है?
-	A: सिम्बायोसिस हॉस्पिटल में आपका स्वागत है। जी हाँ, कार्डियोलॉजी, ऑन्कोलॉजी और न्यूरोलॉजी हमारे प्रमुख विभाग हैं।
+	A: जी हाँ, कार्डियोलॉजी, ऑन्कोलॉजी और न्यूरोलॉजी हमारे प्रमुख विभाग हैं।
 7.	Pharmacy and Blood Bank
 o	Marathi Q: औषधांचे दुकान २४ तास उघडे असते का?
-	A: सिम्बायोसिस हॉस्पिटलमध्ये आपले स्वागत आहे. होय, आमच्या रुग्णालयात २४ तास फार्मसी आणि ब्लड बँक उपलब्ध आहे.
+	A: होय, आमच्या रुग्णालयात २४ तास फार्मसी आणि ब्लड बँक उपलब्ध आहे.
 o	English Q: Is there a pharmacy on-site? / Do you have a blood bank?
 	A: Yes, we have a 24/7 in-house pharmacy and a 24/7 Blood Centre available within the hospital premises.
 8.	Visiting Hours
 o	English Q: What are the IPD visiting hours?
-	A: Welcome to Symbiosis Hospital. General visiting hours are 11:00 am to 1:00 pm and 4:00 pm to 6:00 pm.
+	A: General visiting hours are 11:00 am to 1:00 pm and 4:00 pm to 6:00 pm.
 o	Marathi Q: पेशंटला भेटण्याची वेळ काय आहे?
-	A: सिम्बायोसिस हॉस्पिटलमध्ये आपले स्वागत आहे. भेटण्याची वेळ सकाळी ११ ते १ आणि संध्याकाळी ४ ते ६ आहे.
+	A: भेटण्याची वेळ सकाळी ११ ते १ आणि संध्याकाळी ४ ते ६ आहे.
 9.	Diabetes Clinic
 o	English Q: Do you have a Diabetes Clinic?
-	A: Welcome to Symbiosis Hospital. Yes, we have specialized clinics for Diabetes, Pain Management, and Women's Health.
+	A: Yes, we have specialized clinics for Diabetes, Pain Management, and Women's Health.
 o	Marathi Q: मधुमेहासाठी विशेष क्लिनिक आहे का?
-	A: सिम्बायोसिस हॉस्पिटलमध्ये आपले स्वागत आहे. होय, आमच्याकडे तज्ज्ञ डॉक्टरांच्या मार्गदर्शनाखाली विशेष मधुमेह क्लिनिक चालवले जाते.
+	A: होय, आमच्याकडे तज्ज्ञ डॉक्टरांच्या मार्गदर्शनाखाली विशेष मधुमेह क्लिनिक चालवले जाते.
 10.	Health Check-up
 o	English Q: How do I book a Health Check-up?
-	A: Welcome to Symbiosis Hospital. You can book various health packages by calling +91 9226470807. Please arrive fasting for 10-12 hours.
+	A: You can book various health packages by calling {APPOINTMENT_PHONE}. Please arrive fasting for 10-12 hours.
 11.	Ambulance Services
 o	English Q: Do you provide ambulance services?
-	A: Welcome to Symbiosis Hospital. Yes, we provide 24/7 fully-equipped ambulance services.
+	A: Yes, we provide 24/7 fully-equipped ambulance services.
 o	Hindi Q: क्या अस्पताल की एम्बुलेंस सेवा उपलब्ध है?
-	A: सिम्बायोसिस हॉस्पिटल में आपका स्वागत है। जी हाँ, हमारी एम्बुलेंस सेवा 24/7 उपलब्ध है।
+	A: जी हाँ, हमारी एम्बुलेंस सेवा 24/7 उपलब्ध है।
 o	Marathi Q: रुग्णालयाची रुग्णवाहिका (Ambulance) सेवा उपलब्ध आहे का?
-	A: सिम्बायोसिस हॉस्पिटलमध्ये आपले स्वागत आहे. होय, आमची अद्ययावत रुग्णवाहिका सेवा २४ तास उपलब्ध आहे.
+	A: होय, आमची अद्ययावत रुग्णवाहिका सेवा २४ तास उपलब्ध आहे.
 12.	Wheelchair Assistance
 o	English Q: Are wheelchairs available at the entrance?
 	A: Yes, wheelchairs and stretchers, along with assisting staff, are readily available at the main entrance and emergency drop-off.
@@ -827,16 +850,16 @@ o	English Q: Is there a dedicated parking area for visitors?
 	A: Yes, we have ample parking space for two-wheelers and four-wheelers within the hospital premises.
 24.	Nearby Hotels
 o	English Q: Are there any hotels nearby for outstation relatives?
-	A: Yes, there are several hotels and guest houses in the Lavale and Sus area. Our helpdesk can provide a list.
-25.	Bus Connectivity (PMPML)
-o	English Q: Does the PMPML bus service reach the hospital?
-	A: Yes, PMPML buses ply regularly to the Symbiosis Lavale campus from various parts of Pune.
+	A: {HOSPITAL_SETTINGS['nearby_hotels_answer']}
+25.	Bus Connectivity
+o	English Q: Does the city bus service reach the hospital?
+	A: {HOSPITAL_SETTINGS['bus_answer']}
 26.	ATM Facility
 o	English Q: Is there an ATM inside the hospital campus?
-	A: Yes, there is an ATM facility available within the Symbiosis campus.
+	A: Yes, there is an ATM facility available within the hospital campus.
 27.	Distance from Railway Station
-o	English Q: How far is the hospital from Pune Railway Station?
-	A: The hospital is approximately 18-20 km from Pune Railway Station. It usually takes 45-60 minutes by taxi.
+o	English Q: How far is the hospital from the railway station?
+	A: {HOSPITAL_SETTINGS['railway_station_answer']}
 28.	Walk-in Blood Tests
 o	English Q: Can I get my blood tests done without an appointment?
 	A: Yes, pathology lab services are available for walk-in patients during laboratory hours.
@@ -895,14 +918,15 @@ o	English Q: Can I get a summary of my daily expenses during my stay?
 
 # ---------------------------------------------------------------------------
 # 10. SYSTEM PROMPT
-#     Today's date is injected at startup so the model can resolve relative
-#     date expressions like "tomorrow" or "next Monday" accurately.
+#     Built fresh for every new call so today's date is always current.
+#     (It used to be fixed once at server start, so a server left running
+#     for weeks resolved "tomorrow" to a date long past.)
 # ---------------------------------------------------------------------------
-_today_str = date.today().strftime("%A, %d %B %Y")   # e.g., "Tuesday, 07 April 2026"
-
-system_prompt = f"""
-You are Anjali, a professional and empathetic hospital receptionist at
-Symbiosis University Hospital and Research Center, Pune.
+def build_system_prompt():
+    _today_str = date.today().strftime("%A, %d %B %Y")   # e.g., "Tuesday, 07 April 2026"
+    return f"""
+You are {RECEPTIONIST_NAME}, a professional and empathetic hospital receptionist at
+the {HOSPITAL_NAME}.
 Your role is to assist patients with booking appointments, checking existing
 appointments, and answering general hospital queries.
 
@@ -918,6 +942,10 @@ COMMUNICATION RULES:
 4. Be calm and empathetic. Never rush the patient.
 5. Do not provide medical advice or diagnosis under any circumstance.
 6. Respond in the same language the patient uses — English, Hindi, or Marathi.
+7. The caller was already welcomed when the call started. Never greet or
+   welcome them again; answer the question directly.
+8. For a specific doctor's or department's timings on a given day, answer from
+   the OPD schedule below (or list_available_slots), not from the general FAQ.
 
 DATE AND TIME INTERPRETATION — MANDATORY:
 - Convert any natural date expression ("tomorrow", "next Monday", "15th April",
@@ -953,14 +981,14 @@ If the tool returns a list of matching doctors, read the options clearly to the
 patient and ask them to choose. Then re-submit with the clarified name.
 
 APPOINTMENT RETRIEVAL:
-If a patient provides a booking ID (format: SUH-YYYYMMDD-XXXXX) or their registered
+If a patient provides a booking ID (format: {BOOKING_ID_FORMAT}) or their registered
 phone number, use the get_appointment_by_booking_id tool to retrieve the record.
 If a patient provides their patient ID or phone number to check an appointment,
 use the check_appointment_status tool.
 
 APPOINTMENT CANCELLATION:
 If a patient asks to cancel an appointment, ask for the booking ID
-(format: SUH-YYYYMMDD-XXXXX). Read back the booking ID and ask for a yes or no
+(format: {BOOKING_ID_FORMAT}). Read back the booking ID and ask for a yes or no
 confirmation before calling cancel_appointment. Do not cancel without confirmation.
 
 SLOT AVAILABILITY:
@@ -971,7 +999,7 @@ YYYY-MM-DD format. Resolve any relative date expression first.
 {hospital_faqs}
 
 Current OPD schedules for your reference:
-{json.dumps(DOCTOR_SCHEDULE, indent=2)}
+{json.dumps(DOCTOR_SCHEDULE, separators=(",", ":"))}
 """
 
 # ---------------------------------------------------------------------------
@@ -988,7 +1016,7 @@ class HospitalReceptionistAgent:
             )
         self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.model  = model
-        self.conversation_history = [{"role": "system", "content": system_prompt}]
+        self.conversation_history = [{"role": "system", "content": build_system_prompt()}]
         self.tools  = [
             {
                 "type": "function",
@@ -1066,7 +1094,7 @@ class HospitalReceptionistAgent:
                     "name": "get_appointment_by_booking_id",
                     "description": (
                         "Retrieve an existing appointment record using a booking ID "
-                        "(format: SUH-YYYYMMDD-XXXXX) or the patient's registered "
+                        f"(format: {BOOKING_ID_FORMAT}) or the patient's registered "
                         "phone number."
                     ),
                     "parameters": {
@@ -1132,7 +1160,7 @@ class HospitalReceptionistAgent:
                         "properties": {
                             "booking_id": {
                                 "type": "string",
-                                "description": "The booking ID to cancel (format: SUH-YYYYMMDD-XXXXX).",
+                                "description": f"The booking ID to cancel (format: {BOOKING_ID_FORMAT}).",
                             }
                         },
                         "required": ["booking_id"],
@@ -1178,6 +1206,10 @@ class HospitalReceptionistAgent:
         self.conversation_history = [self.conversation_history[0]] + tail[i:]
 
     def process_user_input(self, user_input: str) -> str:
+        # Remember where this turn starts so a failure can be rolled back.
+        # Otherwise a half-finished tool call stays in the history and every
+        # later OpenAI request for this caller is rejected.
+        turn_start = len(self.conversation_history)
         self.conversation_history.append({"role": "user", "content": user_input})
         try:
             response = self.client.chat.completions.create(
@@ -1255,10 +1287,15 @@ class HospitalReceptionistAgent:
                 self._trim_history()
                 return final_answer
 
-        except Exception as e:
+        except Exception:
+            # The technical error goes to the server log, never to the caller:
+            # the phone reads replies aloud to patients.
+            traceback.print_exc()
+            sys.stderr.flush()
+            del self.conversation_history[turn_start:]
             return (
                 "I'm sorry, I'm having a little trouble connecting right now. "
-                f"Error: {e}"
+                "Please try again in a moment."
             )
 
 

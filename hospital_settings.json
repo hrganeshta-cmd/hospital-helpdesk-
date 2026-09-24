@@ -1,0 +1,14 @@
+{
+  "hospital_name": "Hospital",
+  "receptionist_name": "Anjali",
+  "booking_id_prefix": "SUH",
+  "appointment_phone": "+91 9226470807",
+  "location_answer": {
+    "en": "We are located in Lavale, Pune, accessible via the Pashan - Sus Road.",
+    "hi": "हम लवले, पुणे में स्थित हैं, यहाँ पाषाण-सूस रोड के माध्यम से पहुँचा जा सकता है।",
+    "mr": "आमचे रुग्णालय लवळे, पुणे येथे असून पाषाण-सूस रोडने येथे पोहोचता येते."
+  },
+  "nearby_hotels_answer": "Yes, there are several hotels and guest houses in the Lavale and Sus area. Our helpdesk can provide a list.",
+  "bus_answer": "Yes, PMPML buses ply regularly to the Lavale campus from various parts of Pune.",
+  "railway_station_answer": "The hospital is approximately 18-20 km from Pune Railway Station. It usually takes 45-60 minutes by taxi."
+}
