@@ -732,12 +732,25 @@ def list_available_slots(doctor_name: str, date_str: str) -> str:
     )
 
 
-def _department_matches(query_words, department):
-    """True when a spoken word names the department. The first five letters
-    are compared so spelling variants match (orthopedic / ORTHOPAEDICS)."""
-    dept_words = [w for w in re.split(r"[^A-Z]+", department.upper()) if w]
-    return any(q == d or (len(q) >= 5 and len(d) >= 5 and q[:5] == d[:5])
-               for q in query_words for d in dept_words)
+def _department_score(query_words, department):
+    """How many spoken words name a word of the department. Words compare
+    after folding "AE" to "E", on their first six letters, so spelling
+    variants match (orthopedic / ORTHOPAEDICS) while neurology and
+    neurosurgery stay apart."""
+    fold = lambda w: w.replace("AE", "E")
+    dept_words = [fold(w) for w in re.split(r"[^A-Z]+", department.upper()) if w]
+    return sum(1 for q in map(fold, query_words)
+               if any(q == d or (len(q) >= 6 and len(d) >= 6 and q[:6] == d[:6])
+                      for d in dept_words))
+
+
+def _best_department_matches(query_words, doctors):
+    """Doctors whose department matches the most spoken words, so
+    "general surgery" returns General Surgery rather than every surgery
+    and General Medicine; "oncology" still returns all three oncologies."""
+    scored = {k: _department_score(query_words, v["department"]) for k, v in doctors.items()}
+    best = max(scored.values(), default=0)
+    return {k: doctors[k] for k, sc in scored.items() if best and sc == best}
 
 
 def get_doctors_on_day(day: str, department: str = "") -> str:
@@ -748,11 +761,27 @@ def get_doctors_on_day(day: str, department: str = "") -> str:
     doctor who sits on a different day.
     """
     print(f"--- System: Doctors on '{day}' (department '{department}') ---")
-    day_key = day.strip().upper()
+    words = day.strip().upper().split()
+    day_key = " ".join(w for w in words if w not in {"NEXT", "THIS", "COMING", "ON"})
+    today = date.today()
+    on_date = None
     try:
-        day_key = datetime.strptime(day.strip(), "%Y-%m-%d").strftime("%A").upper()
+        on_date = datetime.strptime(day_key, "%Y-%m-%d").date()
     except ValueError:
-        pass
+        weekdays = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+        if day_key == "TODAY":
+            on_date = today
+        elif day_key == "TOMORROW":
+            on_date = today + timedelta(days=1)
+        elif day_key in weekdays:
+            # The coming occurrence, so the reply quotes the real date
+            # instead of the model calculating one. "Next" skips today.
+            ahead = (weekdays.index(day_key) - today.weekday()) % 7
+            if ahead == 0 and "NEXT" in words:
+                ahead = 7
+            on_date = today + timedelta(days=ahead)
+    if on_date:
+        day_key = on_date.strftime("%A").upper()
 
     if day_key == "SUNDAY":
         return "Our OPDs are closed on Sundays. Emergency services are available 24 hours."
@@ -761,16 +790,16 @@ def get_doctors_on_day(day: str, department: str = "") -> str:
                 "Monday, or a date in YYYY-MM-DD format.")
 
     day_label = day_key.capitalize()
+    if on_date:
+        day_label += on_date.strftime(" %d %B %Y (%Y-%m-%d)")
     doctors = DOCTOR_SCHEDULE[day_key]
     query_words = [w for w in re.split(r"[^A-Z]+", department.upper())
                    if w and w not in {"DEPARTMENT", "DOCTOR", "DR", "OPD"}]
     if query_words:
-        doctors = {k: v for k, v in doctors.items()
-                   if _department_matches(query_words, v["department"])}
+        doctors = _best_department_matches(query_words, doctors)
         if not doctors:
             other_days = [d.capitalize() for d, docs in DOCTOR_SCHEDULE.items()
-                          if any(_department_matches(query_words, v["department"])
-                                 for v in docs.values())]
+                          if _best_department_matches(query_words, docs)]
             if other_days:
                 return (f"No {department} doctor sits on {day_label}. "
                         f"That department runs on: {', '.join(other_days)}.")
@@ -1293,9 +1322,11 @@ class HospitalReceptionistAgent:
                             "day": {
                                 "type": "string",
                                 "description": (
-                                    "Weekday name in English as the caller said it "
-                                    "(e.g. Tuesday). Give a YYYY-MM-DD date only when "
-                                    "the caller named a specific date."
+                                    "The day in English as the caller said it: today, "
+                                    "tomorrow, a weekday (Tuesday), or next Friday. Give "
+                                    "a YYYY-MM-DD date only when the caller named a "
+                                    "specific date. The result states the exact date; "
+                                    "quote that date, never calculate one."
                                 ),
                             },
                             "department": {
