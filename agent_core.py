@@ -676,20 +676,53 @@ def cancel_appointment(booking_id: str) -> str:
         conn.close()
 
 
+def resolve_day(day):
+    """Turn "2026-09-29", "Tuesday", "next Friday", "today" or "tomorrow"
+    into (DAY_NAME, date), or (DAY_NAME, None) when unrecognised. The model
+    miscounts weekdays, so it passes the caller's words and code does the
+    arithmetic. A bare weekday is the coming one; "next" skips today."""
+    words = day.strip().upper().split()
+    day_key = " ".join(w for w in words if w not in {"NEXT", "THIS", "COMING", "ON"})
+    today = date.today()
+    try:
+        on_date = datetime.strptime(day_key, "%Y-%m-%d").date()
+        return on_date.strftime("%A").upper(), on_date
+    except ValueError:
+        pass
+    if day_key == "TODAY":
+        return today.strftime("%A").upper(), today
+    if day_key == "TOMORROW":
+        on_date = today + timedelta(days=1)
+        return on_date.strftime("%A").upper(), on_date
+    weekdays = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+    if day_key in weekdays:
+        ahead = (weekdays.index(day_key) - today.weekday()) % 7
+        if ahead == 0 and "NEXT" in words:
+            ahead = 7
+        return day_key, today + timedelta(days=ahead)
+    return day_key, None
+
+
+def display_name(doctor_key):
+    """ "DR. NEHA KAPADIA" -> "Dr. Neha Kapadia", so text-to-speech reads a
+    name instead of spelling out capital letters."""
+    return doctor_key.title()
+
+
 def list_available_slots(doctor_name: str, date_str: str) -> str:
     """
     Return a doctor's OPD window for a given date and highlight any
     already-confirmed bookings within that window.
-    date_str must be in YYYY-MM-DD format.
+    date_str is YYYY-MM-DD, or the caller's day words (see resolve_day).
     """
     print(f"--- System: Listing slots for '{doctor_name}' on {date_str} ---")
-    try:
-        appt_date = datetime.strptime(date_str.strip(), "%Y-%m-%d")
-    except ValueError:
+    _, resolved = resolve_day(date_str)
+    if resolved is None:
         return (
-            "The date was not understood. Please provide it in YYYY-MM-DD format, "
-            "for example 2026-06-20."
+            "The date was not understood. Please give a weekday such as Tuesday, "
+            "or a date in YYYY-MM-DD format."
         )
+    appt_date = datetime.combine(resolved, datetime.min.time())
 
     day_of_week = appt_date.strftime("%A").upper()
 
@@ -708,7 +741,7 @@ def list_available_slots(doctor_name: str, date_str: str) -> str:
     window = doctor_info["from"] + (
         f" to {doctor_info['to']}" if doctor_info["to"] else " onwards"
     )
-    date_label = appt_date.strftime("%A, %d %B %Y")
+    date_label = appt_date.strftime("%A, %d %B %Y (%Y-%m-%d)")
 
     booked_times = sorted(
         appt["time"]
@@ -720,13 +753,13 @@ def list_available_slots(doctor_name: str, date_str: str) -> str:
 
     if booked_times:
         return (
-            f"{matched_key} ({doctor_info['department']}) is available on "
+            f"{display_name(matched_key)} ({doctor_info['department'].title()}) is available on "
             f"{date_label} from {window}. "
             f"Already booked times on that day: {', '.join(booked_times)}. "
             "Any other time within the window can be booked."
         )
     return (
-        f"{matched_key} ({doctor_info['department']}) is available on "
+        f"{display_name(matched_key)} ({doctor_info['department'].title()}) is available on "
         f"{date_label} from {window}. "
         "No appointments have been booked yet — any time in that window is free."
     )
@@ -761,27 +794,7 @@ def get_doctors_on_day(day: str, department: str = "") -> str:
     doctor who sits on a different day.
     """
     print(f"--- System: Doctors on '{day}' (department '{department}') ---")
-    words = day.strip().upper().split()
-    day_key = " ".join(w for w in words if w not in {"NEXT", "THIS", "COMING", "ON"})
-    today = date.today()
-    on_date = None
-    try:
-        on_date = datetime.strptime(day_key, "%Y-%m-%d").date()
-    except ValueError:
-        weekdays = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
-        if day_key == "TODAY":
-            on_date = today
-        elif day_key == "TOMORROW":
-            on_date = today + timedelta(days=1)
-        elif day_key in weekdays:
-            # The coming occurrence, so the reply quotes the real date
-            # instead of the model calculating one. "Next" skips today.
-            ahead = (weekdays.index(day_key) - today.weekday()) % 7
-            if ahead == 0 and "NEXT" in words:
-                ahead = 7
-            on_date = today + timedelta(days=ahead)
-    if on_date:
-        day_key = on_date.strftime("%A").upper()
+    day_key, on_date = resolve_day(day)
 
     if day_key == "SUNDAY":
         return "Our OPDs are closed on Sundays. Emergency services are available 24 hours."
@@ -807,7 +820,7 @@ def get_doctors_on_day(day: str, department: str = "") -> str:
                     + ", ".join(sorted({v["department"] for v in DOCTOR_SCHEDULE[day_key].values()}))
                     + ".")
 
-    listing = "; ".join(f"{k} ({v['department']}) {v['from']} to {v['to']}"
+    listing = "; ".join(f"{display_name(k)} ({v['department'].title()}) {v['from']} to {v['to']}"
                         for k, v in doctors.items())
     return (f"Doctors on {day_label}: {listing}. "
             "These are the only doctors for this request; do not add any other doctor.")
@@ -1300,7 +1313,11 @@ class HospitalReceptionistAgent:
                             },
                             "date_str": {
                                 "type": "string",
-                                "description": "Date in YYYY-MM-DD format.",
+                                "description": (
+                                    "The day as the caller said it (Tuesday, next "
+                                    "Friday, tomorrow) or a YYYY-MM-DD date. The result "
+                                    "states the exact date; quote it, never calculate one."
+                                ),
                             },
                         },
                         "required": ["doctor_name", "date_str"],
