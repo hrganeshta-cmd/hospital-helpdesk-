@@ -41,4 +41,9 @@ def transcribe(audio):
     if response.status_code != 200:
         # Only the status and the start of the message: never the key.
         raise SttError(f"Pulse {response.status_code}: {response.text[:200]}")
-    return (response.json().get("transcript") or "").strip()
+    data = response.json()
+    text = (data.get("transcript") or data.get("transcription") or data.get("text") or "").strip()
+    if not text:
+        print(f"--- Pulse returned no transcript; response keys: {sorted(data)} "
+              f"start: {response.text[:300]} ---", flush=True)
+    return text
