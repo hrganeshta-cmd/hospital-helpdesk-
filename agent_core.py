@@ -845,7 +845,7 @@ _EXTRACT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "intent": {"type": "string", "enum": ["answer", "question", "stop"]},
+        "intent": {"type": "string", "enum": ["answer", "question"]},
         "name": {"type": "string"}, "phone": {"type": "string"},
         "doctor": {"type": "string", "enum": [""] + list(bf.DOCTOR_NAMES_DEVANAGARI)},
         "date": {"type": "string"}, "time": {"type": "string"}, "reason": {"type": "string"},
@@ -893,7 +893,7 @@ class HospitalReceptionistAgent:
             f"the next days are: {days}. Doctors (key = Devanagari name): {doctors}. "
             "Return empty strings for anything not said. date as YYYY-MM-DD, time as 24-hour HH:MM, "
             "phone as digits only, doctor as one of the keys. intent is 'question' if the caller asked "
-            "something instead of answering, 'stop' if they do not want to book, else 'answer'.")
+            "a question instead of answering, else 'answer'.")
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -960,7 +960,13 @@ class HospitalReceptionistAgent:
         text = bf.to_devanagari(user_input or "").strip()
         language = self.language = detect_language(text, self.language)
         try:
-            if self.booking is not None:
+            if self.booking is None and bf.wants_to_book(text):
+                # A booking request starts the fixed steps at once, in code;
+                # anything already said (doctor, day, time) is kept.
+                reply = self._start_booking({}, text, language)
+                self.conversation_history.append({"role": "user", "content": text})
+                self.conversation_history.append({"role": "assistant", "content": reply})
+            elif self.booking is not None:
                 reply, status = self.booking.handle(text, language)
                 if status == "question":
                     answer = self._chat(text, language)

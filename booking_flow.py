@@ -541,6 +541,30 @@ _STOP_PHRASES = ("stop booking", "cancel booking", "cancel the booking", "don't 
                  "राहू दे", "बुकिंग नको", "बुकिंग रद्द", "नहीं करनी", "नही करनी")
 
 
+_BOOK_WORDS = ("appointment", "appoint", "book", "booking", "reserve", "अपॉइंटमेंट", "अपॉईंटमेंट",
+               "अपाइंटमेंट", "अपॉइंटमेन्ट", "बुक", "बुकिंग", "नंबर लगा", "वेळ घ्याय", "भेट घ्याय",
+               "नाव नोंद", "नाम लिख")
+_NOT_BOOKING = ("cancel", "कैंसल", "रद्द", "status", "check my", "my booking", "my appointment",
+                "मेरी बुकिंग", "मेरा अपॉइंटमेंट", "माझी अपॉइंटमेंट", "माझी बुकिंग", "how can i book",
+                "how do i book", "कैसे बुक", "कसे बुक", "कशी बुक")
+
+
+def wants_to_book(text):
+    """The caller asks to book an appointment (not to cancel or check one)."""
+    s = _norm(text)
+    return any(w in s for w in _BOOK_WORDS) and not any(w in s for w in _NOT_BOOKING)
+
+
+_QUESTION_WORDS = ("where", "what", "when", "how", "which", "who", "why", "is there", "do you",
+                   "कहाँ", "कहां", "क्या", "कौन", "कब", "कैसे", "कितना", "कुठे", "काय", "कोण", "कधी",
+                   "कसे", "किती", "आहे का")
+
+
+def looks_like_question(text):
+    s = _norm(text)
+    return "?" in s or any(w in s for w in _QUESTION_WORDS)
+
+
 def wants_to_stop(text):
     s = _norm(text)
     return any(p in s for p in _STOP_PHRASES)
@@ -594,6 +618,9 @@ def extract_name(text):
     s = re.sub(r"\s*(है|हैं|आहे|hai|aahe)[\s.।!]*$", "", s)
     s = s.strip(" .,।!?\"'")
     if not s or re.search(r"\d", s) or len(s) > 60 or len(s.split()) > 5:
+        return None
+    if find_doctors(s) or phone_digit_count(s) >= 3 or any(
+            h in _norm(s).split() for h in ("dr", "doctor", "डॉ", "डॉक्टर", "डोक्टर")):
         return None
     return s
 
@@ -927,13 +954,19 @@ class BookingFlow:
     def _collect(self, text, language):
         field = self.expect()
         ok, message = self._take(field, text, language)
+        if ok is None:
+            # Details given out of order: a mobile number or a doctor said
+            # while another detail was asked for is kept for later.
+            if field != "phone" and "phone" not in self.f and phone_digits(text):
+                self.f["phone"] = phone_digits(text)
+                return self.prompt(language), "continue"
+            if field != "doctor" and "doctor" not in self.f and len(find_doctors(text)) == 1:
+                self.f["doctor"] = find_doctors(text)[0]
+                return self.prompt(language), "continue"
         if ok is None:                          # nothing usable: try the model
             found = self.extractor(text, field, language) if self.extractor else {}
-            if found.get("intent") == "question":
+            if found.get("intent") == "question" and looks_like_question(text):
                 return "", "question"
-            if found.get("intent") == "stop":
-                self.done = True
-                return TEXT["stopped"][language], "done"
             ok, message = self._take_extracted(field, found, language)
             self._take_others(found, field, language)
         if ok:
