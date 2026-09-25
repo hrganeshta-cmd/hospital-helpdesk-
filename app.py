@@ -33,6 +33,7 @@ from urllib.parse import quote
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 import agent_core
+import booking_sync
 import tts
 
 app = Flask(__name__)
@@ -46,6 +47,17 @@ _last_used = {}
 _lock = threading.Lock()
 
 SESSION_TIMEOUT_SECONDS = 30 * 60  # sessions idle for 30 minutes are removed
+
+# This server's database starts empty after every redeploy; reload upcoming
+# bookings from the reception's Google Sheet (in the background, so the
+# health check is not held up).
+_DOCTORS = sorted(
+    ({"name": name, "department": info["department"]}
+     for day in agent_core.DOCTOR_SCHEDULE.values() for name, info in day.items()),
+    key=lambda d: d["name"])
+_DOCTORS = [d for i, d in enumerate(_DOCTORS) if i == 0 or d["name"] != _DOCTORS[i - 1]["name"]]
+threading.Thread(target=booking_sync.restore,
+                 args=(agent_core.save_appointments, _DOCTORS), daemon=True).start()
 
 
 def _cleanup_idle_sessions():

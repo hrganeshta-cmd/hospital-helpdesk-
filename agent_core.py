@@ -210,6 +210,8 @@ DOCTOR_SCHEDULE = {
 # ---------------------------------------------------------------------------
 import sqlite3
 
+import booking_sync
+
 DB_PATH = os.environ.get("HOSPITAL_DB_PATH",
                          os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "appointments.db"))
@@ -570,6 +572,7 @@ def book_appointment(patient_name: str, phone_number: str, date_str: str,
     all_appointments = load_appointments()
     all_appointments.append(new_appointment)
     save_appointments(all_appointments)
+    booking_sync.send("booked", new_appointment)   # Sheet row + email to the doctor
 
     return (
         f"Appointment confirmed. Your booking ID is {booking_id}. "
@@ -657,6 +660,10 @@ def cancel_appointment(booking_id: str) -> str:
         )
         conn.commit()
         if cursor.rowcount == 1:
+            row = conn.execute(
+                f"SELECT {', '.join(_COLUMNS)} FROM appointments WHERE booking_id = ?", (bid,)
+            ).fetchone()
+            booking_sync.send("cancelled", dict(zip(_COLUMNS, row)))
             return (
                 f"Appointment {bid} has been successfully cancelled. "
                 "If you would like to rebook, please let me know."
