@@ -11,6 +11,9 @@ POST /api/session/start     -> {"session_id": "..."} and the greeting text
 POST /api/chat              -> body {"session_id": "...", "message": "..."}
                                returns {"reply": "..."}
 POST /api/session/end       -> body {"session_id": "..."}; frees the session
+POST /api/voice?session_id= -> body: the caller's recorded speech (WAV)
+                               returns {"heard": "...", "reply": "..."}; the
+                               language (English/Hindi/Marathi) is detected
 POST /api/tts               -> body {"text": "...", "language": "Marathi"}
                                returns MP3 audio (Smallest.ai voice)
 GET  /api/tts?text=...      -> same, for trying a voice in a browser
@@ -34,6 +37,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 
 import agent_core
 import booking_sync
+import stt
 import tts
 
 app = Flask(__name__)
@@ -105,7 +109,28 @@ def chat():
 
     if not message:
         return jsonify({"error": "The 'message' field is required."}), 400
+    session_id, reply = _answer(session_id, message)
+    return jsonify({"session_id": session_id, "reply": reply})
 
+
+@app.post("/api/voice")
+def voice():
+    """One caller turn from recorded audio: speech -> text (Pulse, language
+    detected automatically) -> the receptionist's reply."""
+    session_id = (request.args.get("session_id") or "").strip()
+    try:
+        heard = stt.transcribe(request.get_data())
+    except Exception as e:                      # Pulse unreachable or refused
+        print(f"--- STT error: {type(e).__name__}: {e} ---", flush=True)
+        return jsonify({"error": "Could not hear that right now."}), 502
+    print(f"--- Heard: {heard!r} ---", flush=True)
+    if not heard:
+        return jsonify({"session_id": session_id, "heard": "", "reply": ""})
+    session_id, reply = _answer(session_id, heard)
+    return jsonify({"session_id": session_id, "heard": heard, "reply": reply})
+
+
+def _answer(session_id, message):
     with _lock:
         agent = _sessions.get(session_id)
         if agent is None:
@@ -117,8 +142,7 @@ def chat():
 
     # The OpenAI call happens outside the lock so one slow call
     # does not block every other caller.
-    reply = agent.process_user_input(message)
-    return jsonify({"session_id": session_id, "reply": reply})
+    return session_id, agent.process_user_input(message)
 
 
 @app.route("/api/tts", methods=["GET", "POST"])
