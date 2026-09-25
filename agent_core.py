@@ -994,35 +994,29 @@ or "this Friday" before passing any date to a tool.
 COMMUNICATION RULES:
 1. Speak in short, complete sentences. Maximum two sentences per response.
 2. Use courteous transitions: "Certainly", "Of course", "Thank you for that",
-   "I understand", "Please allow me a moment."
+   "I understand". Never reply only that you will check something: call the
+   tool in the same turn and give the answer.
 3. No bullet points, numbered lists, or text formatting in spoken responses.
 4. Be calm and empathetic. Never rush the patient.
 5. Do not provide medical advice or diagnosis under any circumstance.
-6. Reply in the language of the caller's latest message — English, Hindi,
-   or Marathi — and only that language. A question written in English
-   letters gets an English answer, even though the examples below are in
-   Hindi and Marathi. Hindi uses है / हैं / को / के / कौन; Marathi uses
-   आहे / आहेत / ला / च्या / कोण. In Hindi and Marathi, write doctor names
-   and day names in Devanagari (Hindi मंगलवार, Marathi मंगळवार).
+6. Reply in the language named in the "Reply language" note that comes
+   with each caller message — English, Hindi, or Marathi — and only in that
+   language.
 7. The caller was already welcomed when the call started. Never greet or
    welcome them again; answer the question directly.
 8. Never name the doctors on a day, or give any doctor's days or timings,
    from memory. First call get_doctors_on_day (for a day or a department) or
    list_available_slots (for one named doctor on a date), then mention only
    the doctors the tool returned, with the timings it returned.
-9. (Applies only when replying in Marathi or Hindi.) Always speak about a doctor with the respectful
-   plural form, and keep the whole reply in the caller's one language.
-   Marathi: "डॉ. नेहा कपाडिया सोमवारी उपलब्ध आहेत. त्यांची वेळ सकाळी ९ ते
-   दुपारी १ पर्यंत आहे." Use "त्यांची वेळ" (never "त्यांचा वेळ") and never
-   "आहे", "जिने", "करते" or "करतो" for the doctor. Marathi time words:
-   सकाळी, दुपारी, संध्याकाळी, ... ते ... पर्यंत.
-   Hindi: "डॉ. नेहा कपाडिया सोमवार को उपलब्ध हैं। उनका समय सुबह 9 बजे से
-   दोपहर 1 बजे तक है।" Use "उनका समय" (never "उनकी समय") and never "है",
-   "करती" or "करता" for the doctor. Hindi time words: सुबह, दोपहर, शाम,
-   ... बजे से ... बजे तक. Never use Marathi words (दुपारी, पर्यंत) in Hindi.
-   In both languages always say the part of day before each time, and never
-   say "AM" or "PM". In English, simply say "Dr. Neha Kapadia is available
-   on Monday from 9 AM to 1 PM."
+9. Only when replying in Marathi or Hindi: speak about a doctor with the
+   respectful plural, keep the whole reply in that one language, write names
+   in Devanagari, and say the part of day before each time instead of AM/PM.
+   Marathi pattern: "डॉ. <नाव> <वार> उपलब्ध आहेत. त्यांची वेळ सकाळी <वेळ> ते
+   दुपारी <वेळ> पर्यंत आहे." (त्यांची वेळ; never आहे/करते/करतो for a doctor;
+   day words सकाळी, दुपारी, संध्याकाळी).
+   Hindi pattern: "डॉ. <नाम> <दिन> को उपलब्ध हैं। उनका समय सुबह <समय> बजे से
+   दोपहर <समय> बजे तक है।" (उनका समय; never है/करती/करता for a doctor; day
+   words सुबह, दोपहर, शाम; never Marathi words such as दुपारी or पर्यंत).
 
 DATE AND TIME INTERPRETATION — MANDATORY:
 - Convert any natural date expression ("tomorrow", "next Monday", "15th April",
@@ -1082,6 +1076,17 @@ Doctors and departments (days and timings come only from the tools):
 # ---------------------------------------------------------------------------
 # 11. AGENT CLASS
 # ---------------------------------------------------------------------------
+_MARATHI_MARKERS = ("आहे", "कोण", "काय", "च्या", "चे ", "ची ", "मध्ये", "ळ",
+                    "कधी", "नाही", "तुम्ही", "आम्ही", "पाहिजे", "हवे", "वारी")
+
+def detect_language(text):
+    """English unless the text has Devanagari; then Marathi when it carries
+    a Marathi-only word or letter, otherwise Hindi."""
+    if not re.search(r"[ऀ-ॿ]", text):
+        return "English"
+    return "Marathi" if any(m in text for m in _MARATHI_MARKERS) else "Hindi"
+
+
 class HospitalReceptionistAgent:
     _MAX_HISTORY = 50   # max non-system messages to keep; ~25 full call turns
 
@@ -1324,10 +1329,14 @@ class HospitalReceptionistAgent:
         # later OpenAI request for this caller is rejected.
         turn_start = len(self.conversation_history)
         self.conversation_history.append({"role": "user", "content": user_input})
+        # Stated fresh each turn and never stored, so the reply language
+        # follows the caller rather than the prompt's Hindi/Marathi examples.
+        language_note = {"role": "system",
+                         "content": f"Reply language: {detect_language(user_input)}."}
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.conversation_history,
+                messages=self.conversation_history + [language_note],
                 tools=self.tools,
                 tool_choice="auto",
             )
@@ -1388,7 +1397,7 @@ class HospitalReceptionistAgent:
 
                 second_response = self.client.chat.completions.create(
                     model=self.model,
-                    messages=self.conversation_history,
+                    messages=self.conversation_history + [language_note],
                 )
                 final_answer = second_response.choices[0].message.content
                 self.conversation_history.append(
