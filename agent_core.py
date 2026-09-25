@@ -784,6 +784,7 @@ def standardize_reply(text, language):
     else:
         s = re.sub(r"(डॉक्टर)\s+([ऀ-ॿ]+(?:\s+[ऀ-ॿ]+)?)", _canonical, s)
     s = re.sub(r"\bDoctor\s+Doctor\b", "Doctor", s)
+    s = re.sub(r"\b(SUH-\d{4})\b", lambda m: bf.say_booking_id(m[1]), s)
     s = _ISO_DATE.sub(lambda m: bf.say_date(date(int(m[1]), int(m[2]), int(m[3])), language), s)
     if language == "English":
         s = _CLOCK.sub(lambda m: bf.say_time(datetime.strptime(f"{m[1]}:{m[2]} {m[3]}", "%I:%M %p").time(), "English"), s)
