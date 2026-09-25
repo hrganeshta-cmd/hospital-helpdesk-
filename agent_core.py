@@ -676,11 +676,38 @@ def cancel_appointment(booking_id: str) -> str:
         conn.close()
 
 
+# Weekday words a caller may use, in English, Hindi and Marathi. Devanagari
+# entries match inside longer words too (सोमवारी, सोमवारला).
+_WEEKDAY_WORDS = {
+    "MONDAY":    ["monday", "सोमवार"],
+    "TUESDAY":   ["tuesday", "मंगळवार", "मंगलवार"],
+    "WEDNESDAY": ["wednesday", "बुधवार"],
+    "THURSDAY":  ["thursday", "गुरुवार", "गुरूवार", "बृहस्पतिवार"],
+    "FRIDAY":    ["friday", "शुक्रवार"],
+    "SATURDAY":  ["saturday", "शनिवार"],
+    "SUNDAY":    ["sunday", "रविवार"],
+}
+_NEXT_WORDS = ("next", "पुढच्या", "पुढील", "अगले", "अगला")
+
+def weekday_in_text(text):
+    """The weekday a caller named, e.g. "next WEDNESDAY" or "MONDAY", or
+    None when the text names no weekday (or more than one)."""
+    low = text.lower()
+    found = [day for day, words in _WEEKDAY_WORDS.items()
+             if any((re.search(rf"\b{w}\b", low) if w.isascii() else w in text) for w in words)]
+    if len(found) != 1:
+        return None
+    return ("next " if any(w in low for w in _NEXT_WORDS) else "") + found[0]
+
+
 def resolve_day(day):
     """Turn "2026-09-29", "Tuesday", "next Friday", "today" or "tomorrow"
     into (DAY_NAME, date), or (DAY_NAME, None) when unrecognised. The model
     miscounts weekdays, so it passes the caller's words and code does the
     arithmetic. A bare weekday is the coming one; "next" skips today."""
+    if re.search(r"[ऀ-ॿ]", day):
+        day = (weekday_in_text(day)
+               or ("TOMORROW" if "उद्या" in day else "TODAY" if "आज" in day else day))
     words = day.strip().upper().split()
     day_key = " ".join(w for w in words if w not in {"NEXT", "THIS", "COMING", "ON"})
     today = date.today()
@@ -804,6 +831,29 @@ def _department_score(query_words, department):
                       for d in dept_words))
 
 
+# Everyday Hindi/Marathi words for departments, in case the model passes
+# the caller's word instead of the English department name.
+_DEPARTMENT_WORDS = {
+    "त्वचा": "DERMATOLOGY", "दंत": "DENTAL", "दांत": "DENTAL", "दात": "DENTAL",
+    "किडनी": "NEPHROLOGY", "मूत्रपिंड": "NEPHROLOGY", "गुर्द": "NEPHROLOGY",
+    "आंख": "OPHTHALMOLOGY", "डोळ": "OPHTHALMOLOGY", "नेत्र": "OPHTHALMOLOGY",
+    "हड्डी": "ORTHOPAEDICS", "हाड": "ORTHOPAEDICS", "अस्थि": "ORTHOPAEDICS",
+    "स्त्रीरोग": "GYNAECOLOGY", "गायनो": "GYNAECOLOGY", "प्रसूति": "GYNAECOLOGY",
+    "कान": "ENT", "घसा": "ENT", "गला": "ENT",
+    "मेंदू": "NEUROLOGY", "न्यूरो": "NEUROLOGY", "कर्करोग": "ONCOLOGY",
+    "कैंसर": "ONCOLOGY", "कॅन्सर": "ONCOLOGY", "पेट": "GASTROENTEROLOGY",
+    "पोट": "GASTROENTEROLOGY", "मधुमेह": "ENDOCRINOLOGY", "डायबिटीज": "ENDOCRINOLOGY",
+    "यकृत": "LIVER", "लिवर": "LIVER", "सामान्य": "GENERAL MEDICINE",
+}
+
+def _english_department(department):
+    """Map a Devanagari department word to its English name; English
+    input is returned unchanged."""
+    if not re.search(r"[ऀ-ॿ]", department):
+        return department
+    return " ".join(eng for word, eng in _DEPARTMENT_WORDS.items() if word in department) or department
+
+
 def _best_department_matches(query_words, doctors):
     """Doctors whose department matches the most spoken words, so
     "general surgery" returns General Surgery rather than every surgery
@@ -833,6 +883,7 @@ def get_doctors_on_day(day: str, department: str = "", language: str = "English"
     if on_date:
         day_label += on_date.strftime(" %d %B %Y (%Y-%m-%d)")
     doctors = DOCTOR_SCHEDULE[day_key]
+    department = _english_department(department)
     query_words = [w for w in re.split(r"[^A-Z]+", department.upper())
                    if w and w not in {"DEPARTMENT", "DOCTOR", "DR", "OPD"}]
     if query_words:
@@ -1379,7 +1430,8 @@ class HospitalReceptionistAgent:
                             "department": {
                                 "type": "string",
                                 "description": (
-                                    "Optional. Department in English as in the doctors "
+                                    "Optional. Department in English (never Hindi or "
+                                    "Marathi) as in the doctors "
                                     "list. Everyday words: kidney = Nephrology (kidney "
                                     "stones or urine problems = Urology), skin = "
                                     "Dermatology, bones or joints = Orthopaedics, eyes = "
@@ -1419,6 +1471,17 @@ class HospitalReceptionistAgent:
         # Stated fresh each turn and never stored, so the reply language
         # follows the caller rather than the prompt's Hindi/Marathi examples.
         language = detect_language(user_input)
+        said_day = weekday_in_text(user_input)
+
+        def caller_day(model_day):
+            """The model sometimes turns a weekday into the wrong date
+            (Wednesday -> a Monday). When the caller named a weekday in
+            this message and the model's day disagrees, use the caller's."""
+            if said_day and resolve_day(model_day)[0] != said_day.split()[-1]:
+                print(f"--- System: day '{model_day}' replaced by caller's '{said_day}' ---")
+                return said_day
+            return model_day
+
         language_note = {"role": "system", "content": f"Reply language: {language}."}
         try:
             response = self.client.chat.completions.create(
@@ -1465,12 +1528,12 @@ class HospitalReceptionistAgent:
                     elif fn_name == "list_available_slots":
                         fn_result = list_available_slots(
                             doctor_name=fn_args.get("doctor_name", ""),
-                            date_str=fn_args.get("date_str", ""),
+                            date_str=caller_day(fn_args.get("date_str", "")),
                             language=language,
                         )
                     elif fn_name == "get_doctors_on_day":
                         fn_result = get_doctors_on_day(
-                            day=fn_args.get("day", ""),
+                            day=caller_day(fn_args.get("day", "")),
                             department=fn_args.get("department", ""),
                             language=language,
                         )
