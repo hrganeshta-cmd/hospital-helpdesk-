@@ -10,5 +10,16 @@
   },
   "nearby_hotels_answer": "Yes, there are several hotels and guest houses in the Lavale and Sus area. Our helpdesk can provide a list.",
   "bus_answer": "Yes, PMPML buses ply regularly to the Lavale campus from various parts of Pune.",
-  "railway_station_answer": "The hospital is approximately 18-20 km from Pune Railway Station. It usually takes 45-60 minutes by taxi."
+  "railway_station_answer": "The hospital is approximately 18-20 km from Pune Railway Station. It usually takes 45-60 minutes by taxi.",
+  "voice": {
+    "English": {
+      "voice_id": "sakshi"
+    },
+    "Hindi": {
+      "voice_id": "sakshi"
+    },
+    "Marathi": {
+      "voice_id": "sakshi"
+    }
+  }
 }
