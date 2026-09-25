@@ -1,13 +1,16 @@
 import os
 import json
+import random
 import re
+import sqlite3
 import sys
 import traceback
-import requests
+from datetime import date, datetime
+
 from openai import OpenAI
-from bs4 import BeautifulSoup
-from datetime import datetime, date, timedelta
-import uuid
+
+import booking_flow as bf
+import booking_sync
 
 # ---------------------------------------------------------------------------
 # 1. API CONFIGURATION
@@ -36,15 +39,7 @@ RECEPTIONIST_NAME = HOSPITAL_SETTINGS["receptionist_name"]
 BOOKING_ID_PREFIX = HOSPITAL_SETTINGS["booking_id_prefix"]
 APPOINTMENT_PHONE = HOSPITAL_SETTINGS["appointment_phone"]
 LOCATION_ANSWER   = HOSPITAL_SETTINGS["location_answer"]
-BOOKING_ID_FORMAT = f"{BOOKING_ID_PREFIX}-YYYYMMDD-XXXXX"
-
-# ---------------------------------------------------------------------------
-# 2. MOCK PATIENT DATABASE
-# ---------------------------------------------------------------------------
-MOCK_PATIENT_DB = {
-    "12345": {"name": "Naresh", "appointment": "March 15th at 10:00 AM", "doctor": "Dr. Ramesh"},
-    "67890": {"name": "Harish", "appointment": "No upcoming appointments",  "doctor": "None"},
-}
+BOOKING_ID_FORMAT = f"{BOOKING_ID_PREFIX}-4829"          # prefix + 4 digits
 
 # ---------------------------------------------------------------------------
 # 3. DOCTOR OPD SCHEDULES  — Monday through Saturday (Sunday: OPD closed)
@@ -203,24 +198,21 @@ DOCTOR_SCHEDULE = {
 
 # ---------------------------------------------------------------------------
 # 4. APPOINTMENT STORAGE — SQLite database
-#    Replaces the old appointments.json file. SQLite handles concurrent
-#    requests from many phones safely on one server. The two function names
-#    (load_appointments / save_appointments) are kept the same so that every
-#    other part of this file works without change.
+#    The Railway disk is wiped on every redeploy; booking_sync reloads the
+#    bookings from the reception's Google Sheet when the server starts.
+#    One confirmed booking per doctor per 30-minute slot is enforced by the
+#    database itself, so two callers can never get the same slot.
 # ---------------------------------------------------------------------------
-import sqlite3
-
-import booking_sync
-
 DB_PATH = os.environ.get("HOSPITAL_DB_PATH",
                          os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "appointments.db"))
 
+
 def _get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
-            booking_id      TEXT PRIMARY KEY,
+            booking_id      TEXT NOT NULL,
             patient_name    TEXT NOT NULL,
             phone_number    TEXT NOT NULL,
             date            TEXT NOT NULL,
@@ -229,26 +221,32 @@ def _get_db():
             consultant_name TEXT NOT NULL,
             department      TEXT,
             status          TEXT NOT NULL DEFAULT 'Confirmed',
-            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (booking_id, date)
         )
     """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS one_booking_per_slot
+        ON appointments (consultant_name, date, time) WHERE status = 'Confirmed'
+    """)
     return conn
+
 
 _COLUMNS = ["booking_id", "patient_name", "phone_number", "date", "time",
             "purpose", "consultant_name", "department", "status"]
 
+
 def load_appointments():
     conn = _get_db()
     try:
-        rows = conn.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM appointments"
-        ).fetchall()
+        rows = conn.execute(f"SELECT {', '.join(_COLUMNS)} FROM appointments").fetchall()
         return [dict(zip(_COLUMNS, row)) for row in rows]
     finally:
         conn.close()
 
+
 def save_appointments(appointments):
-    """Insert any appointment that is not yet stored (matched by booking_id)."""
+    """Insert any appointment not yet stored (used to restore from the Sheet)."""
     conn = _get_db()
     try:
         for a in appointments:
@@ -257,669 +255,217 @@ def save_appointments(appointments):
                 f"VALUES ({', '.join('?' for _ in _COLUMNS)})",
                 [a.get(c, "") for c in _COLUMNS],
             )
-        conn.commit()
     finally:
         conn.close()
 
-# ---------------------------------------------------------------------------
-# 5. HELPER — FLEXIBLE TIME PARSER
-#    Accepts spoken/natural time strings and returns a datetime.time object.
-#    Returns None if no known format matches.
-# ---------------------------------------------------------------------------
-def parse_time_flexible(time_str):
-    if not time_str or not isinstance(time_str, str):
-        return None
-    t = time_str.strip().upper()
-    # Insert space before AM/PM if missing: "10:00AM" -> "10:00 AM"
-    t = re.sub(r'(\d)(AM|PM)', r'\1 \2', t)
-    for fmt in ["%I:%M %p", "%I %p", "%H:%M", "%I:%M", "%H:%M:%S"]:
-        try:
-            return datetime.strptime(t, fmt).time()
-        except ValueError:
-            continue
-    return None
 
-# ---------------------------------------------------------------------------
-# 6. HELPER — DOCTOR AVAILABILITY AT A GIVEN TIME
-# ---------------------------------------------------------------------------
-def is_doctor_available_at_time(doctor_info, requested_time_obj):
-    """
-    Returns True if the doctor's OPD window covers the requested time.
-    If the "to" field is empty, any time at or after "from" is accepted.
-    """
-    try:
-        from_str = doctor_info.get("from", "")
-        to_str   = doctor_info.get("to",   "")
-        if not from_str:
-            return False
-        from_time = parse_time_flexible(from_str)
-        if from_time is None:
-            return False
-        if not to_str:
-            return requested_time_obj >= from_time
-        to_time = parse_time_flexible(to_str)
-        if to_time is None:
-            return requested_time_obj >= from_time
-        return from_time <= requested_time_obj <= to_time
-    except Exception:
-        return False
-
-# ---------------------------------------------------------------------------
-# 7. HELPER — FUZZY DOCTOR / DEPARTMENT MATCHER
-#    Handles partial names, informal names ("Sarang sir", "Dr Barbind"),
-#    and department-based queries ("the kidney doctor", "skin specialist").
-#
-#    Resolution sequence:
-#      Step 1 — Filter schedule to the requested day only.
-#      Step 2 — Strip honorifics; score each doctor by word-overlap.
-#      Step 3 — From scored matches, keep only those available at the requested time.
-#      Step 4 — If exactly 1 remains  → "found".
-#               If 2+ remain          → "ambiguous" (agent reads options to patient).
-#               If 0 remain           → try department keyword search on the same day/time.
-#               If still 0            → "not_found".
-# ---------------------------------------------------------------------------
-HONORIFICS = {"DR", "DR.", "DOCTOR", "SIR", "MADAM", "MA'AM", "SAHEB", "JI", "S."}
-
-def find_doctor_match(spoken_name, day_of_week, requested_time_obj=None):
-    if day_of_week not in DOCTOR_SCHEDULE:
-        return {
-            "status":  "not_found",
-            "matches": [],
-            "message": (f"Our OPD is not scheduled on {day_of_week.capitalize()}. "
-                        "OPDs run Monday through Saturday. Please choose another day."),
-        }
-
-    day_schedule = DOCTOR_SCHEDULE[day_of_week]
-
-    # Tokenise and clean the spoken input
-    raw_words    = spoken_name.upper().replace(".", " ").split()
-    spoken_words = [w for w in raw_words if w not in HONORIFICS and w.strip()]
-
-    if not spoken_words:
-        return {
-            "status":  "not_found",
-            "matches": [],
-            "message": "I could not understand the doctor's name. Could you please repeat it?",
-        }
-
-    # --- Score by name word-overlap ---
-    scored = []
-    for doc_key, doc_info in day_schedule.items():
-        key_tokens = [t for t in doc_key.upper().replace(".", " ").split()
-                      if t not in HONORIFICS and t.strip()]
-        score = sum(1 for w in spoken_words if w in key_tokens)
-        if score > 0:
-            scored.append((score, doc_key, doc_info))
-
-    # --- Filter by availability at the requested time ---
-    if requested_time_obj and scored:
-        time_filtered = [
-            (s, k, i) for s, k, i in scored
-            if is_doctor_available_at_time(i, requested_time_obj)
-        ]
-        if time_filtered:
-            scored = time_filtered      # apply only when filter leaves results
-
-    if scored:
-        max_score = max(s for s, _, _ in scored)
-        top = [(k, i) for s, k, i in scored if s == max_score]
-
-        if len(top) == 1:
-            return {"status": "found", "matches": top, "message": ""}
-
-        # Multiple doctors match — return options to agent for disambiguation
-        options = "; ".join(
-            "{} ({}, {}{})" .format(
-                k, i["department"], i["from"],
-                f" to {i['to']}" if i["to"] else ""
-            )
-            for k, i in top
-        )
-        return {
-            "status":  "ambiguous",
-            "matches": top,
-            "message": (
-                f"I found more than one doctor with that name on "
-                f"{day_of_week.capitalize()}: {options}. "
-                "Could you please tell me the department or the full name?"
-            ),
-        }
-
-    # --- No name match — try department keyword search ---
-    dept_matches = []
-    for doc_key, doc_info in day_schedule.items():
-        dept_tokens = doc_info["department"].upper().split()
-        if any(w in dept_tokens for w in spoken_words):
-            if requested_time_obj:
-                if is_doctor_available_at_time(doc_info, requested_time_obj):
-                    dept_matches.append((doc_key, doc_info))
-            else:
-                dept_matches.append((doc_key, doc_info))
-
-    if not dept_matches:
-        return {
-            "status":  "not_found",
-            "matches": [],
-            "message": (
-                f"I could not find any doctor matching '{spoken_name}' on "
-                f"{day_of_week.capitalize()} at the requested time. "
-                "Please verify the name or department, or try a different day or time."
-            ),
-        }
-
-    if len(dept_matches) == 1:
-        return {"status": "found", "matches": dept_matches, "message": ""}
-
-    options = "; ".join(
-        "{} ({}, {}{})" .format(
-            k, i["department"], i["from"],
-            f" to {i['to']}" if i["to"] else ""
-        )
-        for k, i in dept_matches
-    )
-    return {
-        "status":  "department_match",
-        "matches": dept_matches,
-        "message": (
-            f"I found the following doctors in that department on "
-            f"{day_of_week.capitalize()}: {options}. "
-            "Which doctor would you like to consult?"
-        ),
-    }
-
-# ---------------------------------------------------------------------------
-# 8. TOOL FUNCTIONS
-# ---------------------------------------------------------------------------
-
-def check_appointment_status(patient_id: str) -> str:
-    """
-    Check appointments using a Patient ID or phone number.
-    Searches both the mock database and the live appointments.json file.
-    """
-    print(f"--- System: Querying records for: {patient_id} ---")
-    results = []
-
-    # Mock database lookup
-    record = MOCK_PATIENT_DB.get(patient_id)
-    if record:
-        results.append(
-            f"Patient: {record['name']} | "
-            f"Upcoming Appointment: {record['appointment']} | "
-            f"Doctor: {record['doctor']}"
-        )
-
-    # Live appointments.json lookup by phone number or patient name
-    for appt in load_appointments():
-        if (appt.get("phone_number", "") == patient_id or
-                patient_id.lower() in appt.get("patient_name", "").lower()):
-            results.append(
-                f"Booking ID: {appt['booking_id']} | "
-                f"Doctor: {appt['consultant_name']} ({appt['department']}) | "
-                f"Date: {appt['date']} | Time: {appt['time']} | "
-                f"Status: {appt['status']}"
-            )
-
-    if results:
-        return "\n".join(results)
-    return (
-        "No appointment records found for the provided ID. "
-        "Please ask the patient to verify their patient ID or phone number."
-    )
-
-
-def book_appointment(patient_name: str, phone_number: str, date_str: str,
-                     time_str: str, purpose: str, consultant_name: str) -> str:
-    """
-    Book an OPD appointment.
-    - date_str       : YYYY-MM-DD  (the LLM normalises natural language dates)
-    - time_str       : HH:MM AM/PM (the LLM normalises natural language times)
-    - consultant_name: partial or informal name — resolved by find_doctor_match()
-    Checks doctor availability, prevents double-booking, and saves the record.
-    """
-    print(f"--- System: Booking | {patient_name} | {consultant_name} | {date_str} {time_str} ---")
-
-    # 1. Parse date
-    try:
-        appt_date = datetime.strptime(date_str.strip(), "%Y-%m-%d")
-    except ValueError:
-        return (
-            "The date was not understood. Please provide the date in the format "
-            "YYYY-MM-DD, for example 2026-04-15."
-        )
-
-    # 1b. Reject past dates
-    if appt_date.date() < date.today():
-        return (
-            "Appointments cannot be made for past dates. "
-            "Please choose today or a future date."
-        )
-
-    # 2. Parse time with flexible parser
-    req_time = parse_time_flexible(time_str)
-    if req_time is None:
-        return (
-            "The time was not understood. Please provide the time in the format "
-            "HH:MM AM or HH:MM PM, for example 10:00 AM or 02:30 PM."
-        )
-
-    # Canonical storage strings
-    canonical_time = datetime.combine(appt_date, req_time).strftime("%I:%M %p")
-    canonical_date = appt_date.strftime("%Y-%m-%d")
-    day_of_week    = appt_date.strftime("%A").upper()
-
-    # 3. Check day
-    if day_of_week == "SUNDAY":
-        return (
-            "Our OPDs are closed on Sundays. Emergency services are available "
-            "24 hours. Please choose a date between Monday and Saturday."
-        )
-    if day_of_week not in DOCTOR_SCHEDULE:
-        return (
-            f"No OPD schedule is available for {day_of_week.capitalize()}. "
-            "Please choose another day."
-        )
-
-    # 4. Resolve doctor using fuzzy matcher
-    match = find_doctor_match(consultant_name, day_of_week, req_time)
-
-    if match["status"] in ("not_found", "ambiguous", "department_match"):
-        return match["message"]     # Returned to agent; agent speaks it to patient
-
-    matched_key, doctor_info = match["matches"][0]
-
-    # 4b. FIX: enforce the doctor's OPD time window explicitly.
-    #     The matcher's time filter is advisory only — when no doctor fits
-    #     the requested time it falls back to the name match, which allowed
-    #     bookings outside OPD hours. This check closes that gap.
-    if not is_doctor_available_at_time(doctor_info, req_time):
-        window = doctor_info["from"] + (
-            f" to {doctor_info['to']}" if doctor_info["to"] else " onwards"
-        )
-        return (
-            f"{matched_key} is available on {day_of_week.capitalize()} "
-            f"from {window}, so {canonical_time} is outside the OPD hours. "
-            "Please choose a time within this window."
-        )
-
-    # 5. Conflict check — normalise both sides before comparing
-    for appt in load_appointments():
-        existing_time = parse_time_flexible(appt.get("time", ""))
-        existing_canonical = (
-            datetime.combine(appt_date, existing_time).strftime("%I:%M %p")
-            if existing_time else appt.get("time", "")
-        )
-        if (appt["date"] == canonical_date
-                and existing_canonical == canonical_time
-                and appt["consultant_name"].upper() == matched_key.upper()):
-            return (
-                f"The {canonical_time} slot on {canonical_date} with {matched_key} "
-                "is already booked. Please suggest an alternative time."
-            )
-
-    # 6. Generate booking ID and persist
-    booking_id = f"{BOOKING_ID_PREFIX}-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
-    new_appointment = {
-        "booking_id":      booking_id,
-        "patient_name":    patient_name,
-        "phone_number":    phone_number,
-        "date":            canonical_date,
-        "time":            canonical_time,
-        "purpose":         purpose,
-        "consultant_name": matched_key,
-        "department":      doctor_info["department"],
-        "status":          "Confirmed",
-    }
-    all_appointments = load_appointments()
-    all_appointments.append(new_appointment)
-    save_appointments(all_appointments)
-    booking_sync.send("booked", new_appointment)   # Sheet row + email to the doctor
-
-    return (
-        f"Appointment confirmed. Your booking ID is {booking_id}. "
-        f"{matched_key} from {doctor_info['department']} will see you on "
-        f"{appt_date.strftime('%A, %d %B %Y')} at {canonical_time} for {purpose}. "
-        "Please save this booking ID for future reference."
-    )
-
-
-def get_appointment_by_booking_id(booking_id: str = "", phone_number: str = "") -> str:
-    """
-    Retrieve an existing appointment record by booking ID or registered phone number.
-    """
-    appointments = load_appointments()
-    if not appointments:
-        return "No appointments have been booked through this system yet."
-
-    found = []
-    if booking_id:
-        found = [a for a in appointments
-                 if a.get("booking_id", "").upper() == booking_id.strip().upper()]
-    if not found and phone_number:
-        found = [a for a in appointments
-                 if a.get("phone_number", "").strip() == phone_number.strip()]
-
-    if not found:
-        return (
-            "No appointment was found with the provided booking ID or phone number. "
-            "Please verify the details and try again."
-        )
-
-    return "\n".join(
-        f"Booking ID: {a['booking_id']} | "
-        f"Patient: {a['patient_name']} | "
-        f"Doctor: {a['consultant_name']} ({a['department']}) | "
-        f"Date: {a['date']} | Time: {a['time']} | "
-        f"Purpose: {a['purpose']} | Status: {a['status']}"
-        for a in found
-    )
-
-
-def search_web(query: str) -> str:
-    """Search the web for general information not covered by the FAQs."""
-    print(f"--- System: Web search for '{query}' ---")
-    try:
-        from duckduckgo_search import DDGS
-        results = DDGS().text(keywords=query, max_results=3)
-        if results:
-            return "\n\n".join(
-                f"Title: {r['title']}\nSnippet: {r['body']}\nURL: {r['href']}"
-                for r in results
-            )
-        return "No relevant search results found."
-    except Exception as e:
-        return f"Search failed: {e}"
-
-
-def get_url_context(url: str) -> str:
-    """Fetch and return readable paragraph text from a webpage."""
-    print(f"--- System: Fetching {url} ---")
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        text = "\n".join(p.get_text() for p in soup.find_all("p"))
-        return text[:2000] + "..." if len(text) > 2000 else text
-    except Exception as e:
-        return f"Failed to fetch URL content: {e}"
-
-
-def cancel_appointment(booking_id: str) -> str:
-    """
-    Cancel a confirmed appointment by booking ID.
-    Sets the appointment status to 'Cancelled' in the database.
-    Returns an error string if the booking ID is not found or already cancelled.
-    """
-    print(f"--- System: Cancelling booking {booking_id} ---")
-    bid = booking_id.strip().upper()
+def booked_times(doctor_key, iso_date):
+    """Times ('11:00 AM') already booked with this doctor on this date."""
     conn = _get_db()
     try:
-        cursor = conn.execute(
-            "UPDATE appointments SET status = 'Cancelled' "
-            "WHERE booking_id = ? AND status = 'Confirmed'",
-            (bid,),
-        )
-        conn.commit()
-        if cursor.rowcount == 1:
-            row = conn.execute(
-                f"SELECT {', '.join(_COLUMNS)} FROM appointments WHERE booking_id = ?", (bid,)
-            ).fetchone()
-            booking_sync.send("cancelled", dict(zip(_COLUMNS, row)))
-            return (
-                f"Appointment {bid} has been successfully cancelled. "
-                "If you would like to rebook, please let me know."
-            )
-        row = conn.execute(
-            "SELECT status FROM appointments WHERE booking_id = ?", (bid,)
-        ).fetchone()
-        if row:
-            return (
-                f"Booking {bid} is already {row[0]}. No changes were made."
-            )
-        return (
-            "No confirmed appointment was found with that booking ID. "
-            "Please verify the ID and try again."
-        )
+        rows = conn.execute(
+            "SELECT time FROM appointments WHERE consultant_name = ? AND date = ? "
+            "AND status = 'Confirmed'", (doctor_key, iso_date)).fetchall()
+        return {r[0] for r in rows}
     finally:
         conn.close()
 
 
-# Weekday words a caller may use, in English, Hindi and Marathi. Devanagari
-# entries match inside longer words too (सोमवारी, सोमवारला).
-_WEEKDAY_WORDS = {
-    "MONDAY":    ["monday", "सोमवार"],
-    "TUESDAY":   ["tuesday", "मंगळवार", "मंगलवार"],
-    "WEDNESDAY": ["wednesday", "बुधवार"],
-    "THURSDAY":  ["thursday", "गुरुवार", "गुरूवार", "बृहस्पतिवार"],
-    "FRIDAY":    ["friday", "शुक्रवार"],
-    "SATURDAY":  ["saturday", "शनिवार"],
-    "SUNDAY":    ["sunday", "रविवार"],
-}
-_NEXT_WORDS = ("next", "पुढच्या", "पुढील", "अगले", "अगला")
-
-def weekday_in_text(text):
-    """The weekday a caller named, e.g. "next WEDNESDAY" or "MONDAY", or
-    None when the text names no weekday (or more than one)."""
-    low = text.lower()
-    found = [day for day, words in _WEEKDAY_WORDS.items()
-             if any((re.search(rf"\b{w}\b", low) if w.isascii() else w in text) for w in words)]
-    if len(found) != 1:
-        return None
-    return ("next " if any(w in low for w in _NEXT_WORDS) else "") + found[0]
+def _new_booking_id(conn, iso_date):
+    """PREFIX + 4 digits, not used by any booking on record. With about 50
+    bookings a day the 9,000 numbers repeat only after several months, and a
+    booking is always identified together with its date and mobile number."""
+    for _ in range(200):
+        bid = f"{BOOKING_ID_PREFIX}-{random.randint(1000, 9999)}"
+        if not conn.execute("SELECT 1 FROM appointments WHERE booking_id = ?", (bid,)).fetchone():
+            return bid
+    raise RuntimeError("No free booking ID")
 
 
-def resolve_day(day):
-    """Turn "2026-09-29", "Tuesday", "next Friday", "today" or "tomorrow"
-    into (DAY_NAME, date), or (DAY_NAME, None) when unrecognised. The model
-    miscounts weekdays, so it passes the caller's words and code does the
-    arithmetic. A bare weekday is the coming one; "next" skips today."""
-    if re.search(r"[ऀ-ॿ]", day):
-        day = (weekday_in_text(day)
-               or ("TOMORROW" if "उद्या" in day else "TODAY" if "आज" in day else day))
-    words = day.strip().upper().split()
-    day_key = " ".join(w for w in words if w not in {"NEXT", "THIS", "COMING", "ON"})
-    today = date.today()
+def book_slot(name, phone, day, t, reason, doctor_key):
+    """Book atomically. Returns the stored record, or None if the slot was
+    taken in the meantime."""
+    iso, hhmm = day.isoformat(), t.strftime("%I:%M %p")
+    conn = _get_db()
     try:
-        on_date = datetime.strptime(day_key, "%Y-%m-%d").date()
-        return on_date.strftime("%A").upper(), on_date
-    except ValueError:
-        pass
-    if day_key == "TODAY":
-        return today.strftime("%A").upper(), today
-    if day_key == "TOMORROW":
-        on_date = today + timedelta(days=1)
-        return on_date.strftime("%A").upper(), on_date
-    weekdays = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
-    if day_key in weekdays:
-        ahead = (weekdays.index(day_key) - today.weekday()) % 7
-        if ahead == 0 and "NEXT" in words:
-            ahead = 7
-        return day_key, today + timedelta(days=ahead)
-    return day_key, None
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM appointments WHERE consultant_name = ? AND date = ? "
+                        "AND time = ? AND status = 'Confirmed'", (doctor_key, iso, hhmm)).fetchone():
+            conn.execute("ROLLBACK")
+            return None
+        record = {
+            "booking_id": _new_booking_id(conn, iso), "patient_name": name, "phone_number": phone,
+            "date": iso, "time": hhmm, "purpose": reason, "consultant_name": doctor_key,
+            "department": bf.doctor_department(sys.modules[__name__], doctor_key), "status": "Confirmed",
+        }
+        conn.execute(f"INSERT INTO appointments ({', '.join(_COLUMNS)}) "
+                     f"VALUES ({', '.join('?' for _ in _COLUMNS)})", [record[c] for c in _COLUMNS])
+        conn.execute("COMMIT")
+    except sqlite3.IntegrityError:
+        conn.execute("ROLLBACK")
+        return None
+    finally:
+        conn.close()
+    print(f"--- System: booked {record['booking_id']} ({doctor_key}, {iso} {hhmm}) ---", flush=True)
+    booking_sync.send("booked", record)          # Sheet row + email to the doctor
+    return record
 
 
-def display_name(doctor_key):
-    """ "DR. NEHA KAPADIA" -> "Dr. Neha Kapadia", so text-to-speech reads a
-    name instead of spelling out capital letters."""
-    return doctor_key.title()
+def normalize_booking_id(text):
+    """'S U H 4 8 2 9', 'suh 4829', 'एस यू एच चार आठ दो नौ' -> 'SUH-4829'."""
+    s = bf.to_devanagari(text or "")
+    old = re.search(r"[A-Z]+-\d{8}-[0-9A-Z]{5}", s.upper())
+    if old:
+        return old.group(0)
+    tokens = re.findall(r"[0-9]+|[a-z]+|[\u0900-\u097F]+", bf._norm(s))
+    digits = "".join(t if t.isdigit() else bf._PHONE_DIGIT_WORDS.get(t, "") for t in tokens)
+    return f"{BOOKING_ID_PREFIX}-{digits}" if len(digits) == 4 else None
 
 
-_DEVANAGARI_DIGITS = str.maketrans("0123456789", "०१२३४५६७८९")
-
-def spoken_time(time_str, language):
-    """ "01:30 PM" -> "दुपारी १:३०" (Marathi) or "दोपहर 1:30 बजे" (Hindi).
-    Built in code because the model kept dropping the part of day."""
-    t = parse_time_flexible(time_str)
-    if t is None:
-        return time_str
-    hour12 = t.hour % 12 or 12
-    clock = f"{hour12}:{t.minute:02d}" if t.minute else f"{hour12}"
-    if language == "Marathi":
-        part = ("सकाळी" if t.hour < 12 else "दुपारी" if t.hour < 17
-                else "संध्याकाळी" if t.hour < 20 else "रात्री")
-        return f"{part} {clock.translate(_DEVANAGARI_DIGITS)}"
-    part = ("सुबह" if t.hour < 12 else "दोपहर" if t.hour < 16
-            else "शाम" if t.hour < 20 else "रात")
-    return f"{part} {clock} बजे"
+def find_booking(booking_id, phone):
+    """The booking with this ID *and* this mobile number, or None."""
+    bid, digits = normalize_booking_id(booking_id), bf.phone_digits(phone)
+    if not bid or not digits:
+        return None
+    for a in load_appointments():
+        if a["booking_id"] == bid and a["phone_number"] == digits and a["date"] >= bf.today_ist().isoformat():
+            return a
+    return None
 
 
-def spoken_window(time_from, time_to, language="English"):
-    """A doctor's OPD window as it should be said in the reply language."""
-    if language == "Marathi":
-        return f"{spoken_time(time_from, language)} ते {spoken_time(time_to, language)} पर्यंत"
-    if language == "Hindi":
-        return f"{spoken_time(time_from, language)} से {spoken_time(time_to, language)} तक"
-    return f"{time_from} to {time_to}"
+def cancel_booking(booking_id, phone):
+    """'cancelled', 'already' (already cancelled) or 'not_found'."""
+    record = find_booking(booking_id, phone)
+    if not record:
+        return "not_found", None
+    if record["status"] != "Confirmed":
+        return "already", record
+    conn = _get_db()
+    try:
+        conn.execute("UPDATE appointments SET status = 'Cancelled' WHERE booking_id = ? AND date = ?",
+                     (record["booking_id"], record["date"]))
+    finally:
+        conn.close()
+    record = {**record, "status": "Cancelled"}
+    print(f"--- System: cancelled {record['booking_id']} ---", flush=True)
+    booking_sync.send("cancelled", record)
+    return "cancelled", record
 
 
-def list_available_slots(doctor_name: str, date_str: str, language: str = "English") -> str:
-    """
-    Return a doctor's OPD window for a given date and highlight any
-    already-confirmed bookings within that window.
-    date_str is YYYY-MM-DD, or the caller's day words (see resolve_day).
-    """
-    print(f"--- System: Listing slots for '{doctor_name}' on {date_str} ---")
-    # The model sometimes asks for "all departments" or "any doctor" here;
-    # answer with the whole day's list instead of "no doctor found".
-    generic = {"ALL", "ANY", "DEPARTMENT", "DEPARTMENTS", "DOCTOR", "DOCTORS", "AVAILABLE", "DR"}
-    if set(re.findall(r"[A-Z]+", doctor_name.upper())) <= generic:
-        return get_doctors_on_day(date_str, "", language)
-    _, resolved = resolve_day(date_str)
-    if resolved is None:
-        return (
-            "The date was not understood. Please give a weekday such as Tuesday, "
-            "or a date in YYYY-MM-DD format."
-        )
-    appt_date = datetime.combine(resolved, datetime.min.time())
-
-    day_of_week = appt_date.strftime("%A").upper()
-
-    if day_of_week == "SUNDAY":
-        return "Our OPDs are closed on Sundays. Please choose a weekday or Saturday."
-    if day_of_week not in DOCTOR_SCHEDULE:
-        return f"No OPD is scheduled on {day_of_week.capitalize()}."
-
-    match = find_doctor_match(doctor_name, day_of_week)
-    if match["status"] == "not_found":
-        return match["message"]
-    if match["status"] in ("ambiguous", "department_match"):
-        return match["message"]
-
-    matched_key, doctor_info = match["matches"][0]
-    window = (spoken_window(doctor_info["from"], doctor_info["to"], language)
-              if doctor_info["to"] else doctor_info["from"] + " onwards")
-    date_label = appt_date.strftime("%A, %d %B %Y (%Y-%m-%d)")
-
-    booked_times = sorted(
-        appt["time"]
-        for appt in load_appointments()
-        if appt["date"] == appt_date.strftime("%Y-%m-%d")
-        and appt["consultant_name"].upper() == matched_key.upper()
-        and appt["status"] == "Confirmed"
-    )
-
-    if booked_times:
-        return (
-            f"{display_name(matched_key)} ({doctor_info['department'].title()}) is available on "
-            f"{date_label}, time: {window}. "
-            f"Already booked times on that day: {', '.join(booked_times)}. "
-            "Any other time within the window can be booked."
-        )
-    return (
-        f"{display_name(matched_key)} ({doctor_info['department'].title()}) is available on "
-        f"{date_label}, time: {window}. "
-        "No appointments have been booked yet — any time in that window is free."
-    )
+def record_callback(fields):
+    """Ask reception to call the patient back (the booking could not be finished)."""
+    booking_sync.send("callback", {
+        "patient_name": fields.get("name", ""), "phone_number": fields.get("phone", ""),
+        "consultant_name": fields.get("doctor", ""),
+        "department": bf.doctor_department(sys.modules[__name__], fields["doctor"]) if fields.get("doctor") else "",
+        "date": fields["date"].isoformat() if fields.get("date") else "",
+        "time": fields["time"].strftime("%I:%M %p") if fields.get("time") else "",
+        "purpose": fields.get("reason", ""),
+    })
+    print("--- System: call-back request recorded ---", flush=True)
 
 
-def _department_score(query_words, department):
-    """How many spoken words name a word of the department. Words compare
-    after folding "AE" to "E", on their first six letters, so spelling
-    variants match (orthopedic / ORTHOPAEDICS) while neurology and
-    neurosurgery stay apart."""
-    fold = lambda w: w.replace("AE", "E")
-    dept_words = [fold(w) for w in re.split(r"[^A-Z]+", department.upper()) if w]
-    return sum(1 for q in map(fold, query_words)
-               if any(q == d or (len(q) >= 6 and len(d) >= 6 and q[:6] == d[:6])
-                      for d in dept_words))
+def bookings_ready():
+    """False until today's bookings have been reloaded from the Sheet."""
+    return booking_sync.is_ready()
+
+# ---------------------------------------------------------------------------
+# 5. SCHEDULE LOOK-UPS FOR THE LANGUAGE MODEL
+#    Every answer is written in the caller's language, with doctors, days,
+#    dates and times already in their spoken form, so the model repeats them
+#    instead of inventing its own wording.
+# ---------------------------------------------------------------------------
+_CORE = sys.modules[__name__]
 
 
-# Everyday Hindi/Marathi words for departments, in case the model passes
-# the caller's word instead of the English department name.
-_DEPARTMENT_WORDS = {
-    "त्वचा": "DERMATOLOGY", "दंत": "DENTAL", "दांत": "DENTAL", "दात": "DENTAL",
-    "किडनी": "NEPHROLOGY", "मूत्रपिंड": "NEPHROLOGY", "गुर्द": "NEPHROLOGY",
-    "आंख": "OPHTHALMOLOGY", "डोळ": "OPHTHALMOLOGY", "नेत्र": "OPHTHALMOLOGY",
-    "हड्डी": "ORTHOPAEDICS", "हाड": "ORTHOPAEDICS", "अस्थि": "ORTHOPAEDICS",
-    "स्त्रीरोग": "GYNAECOLOGY", "गायनो": "GYNAECOLOGY", "प्रसूति": "GYNAECOLOGY",
-    "कान": "ENT", "घसा": "ENT", "गला": "ENT",
-    "मेंदू": "NEUROLOGY", "न्यूरो": "NEUROLOGY", "कर्करोग": "ONCOLOGY",
-    "कैंसर": "ONCOLOGY", "कॅन्सर": "ONCOLOGY", "पेट": "GASTROENTEROLOGY",
-    "पोट": "GASTROENTEROLOGY", "मधुमेह": "ENDOCRINOLOGY", "डायबिटीज": "ENDOCRINOLOGY",
-    "यकृत": "LIVER", "लिवर": "LIVER", "सामान्य": "GENERAL MEDICINE",
-}
-
-def _english_department(department):
-    """Map a Devanagari department word to its English name; English
-    input is returned unchanged."""
-    if not re.search(r"[ऀ-ॿ]", department):
-        return department
-    return " ".join(eng for word, eng in _DEPARTMENT_WORDS.items() if word in department) or department
-
-
-def _best_department_matches(query_words, doctors):
-    """Doctors whose department matches the most spoken words, so
-    "general surgery" returns General Surgery rather than every surgery
-    and General Medicine; "oncology" still returns all three oncologies."""
-    scored = {k: _department_score(query_words, v["department"]) for k, v in doctors.items()}
-    best = max(scored.values(), default=0)
-    return {k: doctors[k] for k, sc in scored.items() if best and sc == best}
+def _resolve_day(day):
+    d = bf.parse_date(day or "")
+    return d
 
 
 def get_doctors_on_day(day: str, department: str = "", language: str = "English") -> str:
-    """
-    List the doctors sitting on one day, optionally only one department.
-    day is a weekday name (e.g. "Monday") or a date in YYYY-MM-DD format.
-    Only that day's doctors are returned, so the agent cannot mix in a
-    doctor who sits on a different day.
-    """
-    print(f"--- System: Doctors on '{day}' (department '{department}') ---")
-    day_key, on_date = resolve_day(day)
+    """Doctors sitting on one day, for one department (or the departments
+    open that day when no department is given)."""
+    d = _resolve_day(day)
+    if not d:
+        return "The day was not understood. Ask the caller for a day such as Monday or a date such as 2 October."
+    weekday = bf.WEEKDAYS[d.weekday()]
+    when = bf.say_date(d, language)
+    if weekday == "SUNDAY" or weekday not in DOCTOR_SCHEDULE:
+        return f"{when}: the OPD is closed on Sundays. Emergency services are open 24 hours."
+    doctors = DOCTOR_SCHEDULE[weekday]
+    if not (department or "").strip():
+        depts = sorted({info["department"] for info in doctors.values()})
+        names = ", ".join(bf.say_department(x, language) for x in depts)
+        return (f"On {when} the OPD has these departments: {names}. "
+                "Do not read this list out; ask the caller which department or doctor they need.")
+    wanted = bf.find_departments(department) or [
+        k for k in bf.DEPARTMENT_NAMES
+        if bf._norm(department) in (k.lower(), bf.say_department(k, "English").lower())]
+    if not wanted:
+        return f"'{department}' is not a department in our OPD schedule."
+    found = [(k, v) for k, v in doctors.items() if v["department"] in wanted]
+    if not found:
+        days = [w for w, docs in DOCTOR_SCHEDULE.items()
+                if any(v["department"] in wanted for v in docs.values())]
+        return (f"No {bf.say_department(wanted[0], language)} doctor sits on {when}. "
+                f"That department runs on {bf.say_days(days, language)}.")
+    parts = [f"{bf.say_doctor(k, language)} ({bf.say_department(v['department'], language)}), "
+             f"{bf.say_window(bf._t(v['from']), bf._t(v['to']), language)}" for k, v in found]
+    return f"On {when}: " + "; ".join(parts) + "."
 
-    if day_key == "SUNDAY":
-        return "Our OPDs are closed on Sundays. Emergency services are available 24 hours."
-    if day_key not in DOCTOR_SCHEDULE:
-        return ("The day was not understood. Please give a weekday name such as "
-                "Monday, or a date in YYYY-MM-DD format.")
 
-    day_label = day_key.capitalize()
-    if on_date:
-        day_label += on_date.strftime(" %d %B %Y (%Y-%m-%d)")
-    doctors = DOCTOR_SCHEDULE[day_key]
-    department = _english_department(department)
-    query_words = [w for w in re.split(r"[^A-Z]+", department.upper())
-                   if w and w not in {"DEPARTMENT", "DOCTOR", "DR", "OPD"}]
-    if query_words:
-        doctors = _best_department_matches(query_words, doctors)
-        if not doctors:
-            other_days = [d.capitalize() for d, docs in DOCTOR_SCHEDULE.items()
-                          if _best_department_matches(query_words, docs)]
-            if other_days:
-                return (f"No {department} doctor sits on {day_label}. "
-                        f"That department runs on: {', '.join(other_days)}.")
-            return (f"'{department}' was not recognised. Departments on {day_label}: "
-                    + ", ".join(sorted({v["department"] for v in DOCTOR_SCHEDULE[day_key].values()}))
-                    + ".")
+def get_doctor_schedule(doctor: str, language: str = "English") -> str:
+    """The days and hours one doctor sits, across the whole week."""
+    keys = bf.find_doctors(doctor)
+    if not keys:
+        return f"No doctor named '{doctor}' is in the schedule. Ask the caller to repeat the name or give the department."
+    if len(keys) > 1:
+        return "More than one doctor matches: " + ", ".join(bf.say_doctor(k, language) for k in keys) + ". Ask which one."
+    key = keys[0]
+    days = bf.doctor_days(_CORE, key)
+    window = bf.say_window(*next(iter(days.values())), language)
+    return (f"{bf.say_doctor(key, language)} ({bf.say_department(bf.doctor_department(_CORE, key), language)}) "
+            f"sits on {bf.say_days(days, language)}, {window}.")
 
-    listing = "; ".join(f"{display_name(k)} ({v['department'].title()}) "
-                        f"time: {spoken_window(v['from'], v['to'], language)}"
-                        for k, v in doctors.items())
-    return (f"Doctors on {day_label}: {listing}. "
-            "These are the only doctors for this request; do not add any other doctor. "
-            "Say each time exactly as written after 'time:'.")
 
+def get_free_slots(doctor: str, day: str, language: str = "English") -> str:
+    """Free 30-minute appointment times with one doctor on one day."""
+    keys = bf.find_doctors(doctor)
+    if len(keys) != 1:
+        return get_doctor_schedule(doctor, language)
+    key, d = keys[0], _resolve_day(day)
+    if not d:
+        return "The day was not understood. Ask the caller for a day such as Monday or a date such as 2 October."
+    days = bf.doctor_days(_CORE, key)
+    if bf.WEEKDAYS[d.weekday()] not in days:
+        return (f"{bf.say_doctor(key, language)} does not sit on {bf.say_date(d, language)}. "
+                + get_doctor_schedule(doctor, language))
+    slots = bf.free_slots(_CORE, key, d)
+    if not slots:
+        return f"{bf.say_doctor(key, language)} has no free time on {bf.say_date(d, language)}."
+    return (f"Free times with {bf.say_doctor(key, language)} on {bf.say_date(d, language)}: "
+            f"{bf.say_slots(slots[:6], language)}"
+            + (" and more." if len(slots) > 6 else "."))
+
+
+def describe_booking(record, language):
+    key = record["consultant_name"]
+    d = date.fromisoformat(record["date"])
+    t = datetime.strptime(record["time"], "%I:%M %p").time()
+    status = {"Confirmed": "confirmed", "Cancelled": "cancelled"}.get(record["status"], record["status"])
+    return (f"Booking {bf.say_booking_id(record['booking_id'])} is {status}: {record['patient_name']}, "
+            f"with {bf.say_doctor(key, language)} on {bf.say_date(d, language)} at {bf.say_time(t, language)}.")
+
+
+def get_my_appointment(booking_id: str, phone: str, language: str = "English") -> str:
+    record = find_booking(booking_id, phone)
+    if not record:
+        return "No upcoming booking was found with that booking ID and mobile number. Ask the caller to check both."
+    return describe_booking(record, language)
 
 # ---------------------------------------------------------------------------
-# 9. HOSPITAL FAQ KNOWLEDGE BASE
+# 6. HOSPITAL FAQ KNOWLEDGE BASE
 # ---------------------------------------------------------------------------
 hospital_faqs = f"""
 Based on the provided FAQ document for the hospital, here are the questions and answers arranged in English, Hindi, and Marathi:
@@ -1101,172 +647,104 @@ o	English Q: Can I get a summary of my daily expenses during my stay?
 """
 
 # ---------------------------------------------------------------------------
-# 10. SYSTEM PROMPT
+# 7. SYSTEM PROMPT
 #     Built fresh for every new call so today's date is always current.
-#     (It used to be fixed once at server start, so a server left running
-#     for weeks resolved "tomorrow" to a date long past.)
+#     The booking conversation itself is run by booking_flow in code; the
+#     model answers questions and starts a booking with start_booking.
 # ---------------------------------------------------------------------------
-# Names and departments only; each doctor's days and timings are looked up
-# through get_doctors_on_day / list_available_slots so they are never guessed.
-DOCTOR_ROSTER_TEXT = "; ".join(sorted(
-    {f"{name} ({info['department']})"
-     for docs in DOCTOR_SCHEDULE.values() for name, info in docs.items()},
-    key=lambda s: s.split("(")[1]))
+DEPARTMENT_LIST = ", ".join(sorted(bf.say_department(k, "English") for k in bf.DEPARTMENT_NAMES))
+
 
 def build_system_prompt():
-    _today_str = date.today().strftime("%A, %d %B %Y")   # e.g., "Tuesday, 07 April 2026"
-    # The model miscounts weekdays (it once took "Tuesday" to be a Sunday),
-    # so the next seven dates are listed for it to read instead.
-    _next_week = "; ".join(
-        (date.today() + timedelta(days=i)).strftime("%A %Y-%m-%d") for i in range(1, 8))
+    today = bf.today_ist()
     return f"""
-You are {RECEPTIONIST_NAME}, a professional and empathetic hospital receptionist at
-the {HOSPITAL_NAME}.
-Your role is to assist patients with booking appointments, checking existing
-appointments, and answering general hospital queries.
+You are {RECEPTIONIST_NAME}, the receptionist at the {HOSPITAL_NAME}. You answer
+callers' questions and help them book, check or cancel OPD appointments.
+Today is {bf.say_date(today, "English")} {today.year}.
 
-Today's date is {_today_str}.
-The next seven days are: {_next_week}.
-Use this to resolve relative date expressions such as "tomorrow", "next Monday",
-or "this Friday" before passing any date to a tool.
+RULES:
+1. Reply in the language named in the "Reply language" note that comes with
+   each caller message (English, Hindi or Marathi) and only in that language.
+   Hindi and Marathi replies are always written in Devanagari.
+2. Keep every reply to at most two short sentences. Never use lists,
+   numbering or bullet points. If there are many options, mention at most
+   three and ask which one the caller wants.
+3. Always say "Doctor" (English) or "डॉक्टर" (Hindi and Marathi) before a
+   doctor's name, never "Dr." or "डॉ.". Use doctor names, days, dates and
+   times exactly as the tools write them.
+4. Doctors, their days, hours and free times come only from the tools
+   get_doctors_on_day, get_doctor_schedule and get_free_slots, never from
+   memory.
+5. When the caller wants to book an appointment, call start_booking at once,
+   passing any doctor, department, day or time they already mentioned. Do
+   not ask for the name, mobile number or other details yourself; the
+   booking steps ask for them.
+6. To check or cancel a booking you need both the booking ID (for example
+   {BOOKING_ID_FORMAT}) and the mobile number. Before cancelling, read the
+   booking back and ask yes or no; call cancel_my_appointment only after the
+   caller says yes.
+7. Never give medical advice. If something is not covered by the FAQ or the
+   tools, give our appointment desk number {APPOINTMENT_PHONE}.
+8. The caller was already welcomed; never greet them again.
+9. In Hindi and Marathi speak of a doctor respectfully: "डॉक्टर ... उपलब्ध
+   हैं" (Hindi), "डॉक्टर ... उपलब्ध आहेत" (Marathi).
 
-COMMUNICATION RULES:
-1. Speak in short, complete sentences. Maximum two sentences per response.
-2. Use courteous transitions: "Certainly", "Of course", "Thank you for that",
-   "I understand". Never reply only that you will check something: call the
-   tool in the same turn and give the answer.
-3. No bullet points, numbered lists, or text formatting in spoken responses.
-4. Be calm and empathetic. Never rush the patient.
-5. Do not provide medical advice or diagnosis under any circumstance.
-6. Reply in the language named in the "Reply language" note that comes
-   with each caller message — English, Hindi, or Marathi — and only in that
-   language. Hindi and Marathi replies are always written in Devanagari,
-   even when the caller's words arrive in English letters (the phone
-   sometimes writes Hindi or Marathi speech that way).
-7. The caller was already welcomed when the call started. Never greet or
-   welcome them again; answer the question directly.
-8. Never name the doctors on a day, or give any doctor's days or timings,
-   from memory. First call get_doctors_on_day (for a day or a department) or
-   list_available_slots (for one named doctor on a date), then mention only
-   the doctors the tool returned, with the timings it returned.
-9. Only when replying in Marathi or Hindi: speak about a doctor with the
-   respectful plural, keep the whole reply in that one language, write names
-   in Devanagari, and say each time exactly as the tool wrote it after
-   "time:" (it already includes सकाळी/दुपारी or सुबह/दोपहर).
-   Marathi pattern: "डॉ. <नाव> <वार> उपलब्ध आहेत. त्यांची वेळ सकाळी <वेळ> ते
-   दुपारी <वेळ> पर्यंत आहे." (त्यांची वेळ; never आहे/करते/करतो for a doctor;
-   day words सकाळी, दुपारी, संध्याकाळी).
-   Hindi pattern: "डॉ. <नाम> <दिन> को उपलब्ध हैं। उनका समय सुबह <समय> बजे से
-   दोपहर <समय> बजे तक है।" (उनका समय; never है/करती/करता for a doctor; day
-   words सुबह, दोपहर, शाम; never Marathi words such as दुपारी or पर्यंत).
-
-DATE AND TIME INTERPRETATION — MANDATORY:
-- Convert any natural date expression ("tomorrow", "next Monday", "15th April",
-  "April 15", "this coming Saturday") to YYYY-MM-DD format before using it.
-- Convert any natural time expression to HH:MM AM/PM format before using it.
-  Examples:
-    "10 in the morning"  →  10:00 AM
-    "2 in the afternoon" →  02:00 PM
-    "half past 3"        →  03:30 PM
-    "around 11"          →  11:00 AM
-    "evening"            →  Use 04:00 PM as default and confirm with patient.
-  Morning means AM. Afternoon and evening mean PM.
-
-APPOINTMENT BOOKING — MANDATORY STEP-BY-STEP SEQUENCE:
-Collect one piece of information at a time in this exact order.
-Do not combine questions. Wait for the patient's response at each step.
-
-  Step 1 — Ask for the patient's full name.
-  Step 2 — Ask for the patient's phone number.
-  Step 3 — Ask for the preferred date. Convert to YYYY-MM-DD internally.
-  Step 4 — Ask for the preferred time. Convert to HH:MM AM/PM internally.
-  Step 5 — Ask for the purpose or reason for the visit.
-  Step 6 — Ask for the doctor's name or department.
-
-Before calling book_appointment, read back all six details clearly to the patient
-and ask for a yes or no confirmation. Call the tool only after receiving explicit
-confirmation.
-
-DOCTOR IDENTIFICATION:
-The book_appointment tool resolves partial and informal doctor names automatically.
-Pass exactly what the patient says for the doctor's name or department.
-If the tool returns a list of matching doctors, read the options clearly to the
-patient and ask them to choose. Then re-submit with the clarified name.
-
-APPOINTMENT RETRIEVAL:
-If a patient provides a booking ID (format: {BOOKING_ID_FORMAT}) or their registered
-phone number, use the get_appointment_by_booking_id tool to retrieve the record.
-If a patient provides their patient ID or phone number to check an appointment,
-use the check_appointment_status tool.
-
-APPOINTMENT CANCELLATION:
-If a patient asks to cancel an appointment, ask for the booking ID
-(format: {BOOKING_ID_FORMAT}). Read back the booking ID and ask for a yes or no
-confirmation before calling cancel_appointment. Do not cancel without confirmation.
-
-SLOT AVAILABILITY:
-If a patient asks when a doctor is free, available, or what times can be booked,
-use list_available_slots with the doctor's name and the requested date in
-YYYY-MM-DD format. Resolve any relative date expression first.
+Departments in our OPD: {DEPARTMENT_LIST}.
 
 {hospital_faqs}
-
-Doctors and departments (days and timings come only from the tools):
-{DOCTOR_ROSTER_TEXT}
 """
 
 # ---------------------------------------------------------------------------
-# 11. AGENT CLASS
+# 8. LANGUAGE AND SPEAKING STANDARDS
 # ---------------------------------------------------------------------------
-_MARATHI_MARKERS = ("आहे", "कोण", "काय", "च्या", "चे ", "ची ", "मध्ये", "ळ",
-                    "कधी", "नाही", "तुम्ही", "आम्ही", "पाहिजे", "हवे", "वारी")
-
-# Hindi and Marathi typed or transcribed in English letters ("Somvar ko
-# kidney ke doctor kaun hain?"). The phone's speech recogniser writes Hindi
-# and Marathi speech like this when it listens in English. Only words that
-# are not ordinary English words are listed.
+_MARATHI_WORDS = {"आहे", "आहेत", "कोण", "काय", "मला", "तुम्हाला", "आम्हाला", "कधी", "नाही", "हवे",
+                  "हवी", "हवा", "पाहिजे", "करायची", "करायचे", "करायचा", "सांगा", "माझे", "माझा",
+                  "माझी", "तुमचा", "तुमचे", "तुमची", "आणि", "किंवा", "होय", "आहात", "कुठे", "कसे"}
+_MARATHI_PARTS = ("च्या", "ळ", "वारी", "ला ", "ऊ")
+_HINDI_WORDS = {"है", "हैं", "नहीं", "मुझे", "क्या", "कौन", "कब", "को", "के", "की", "से", "में",
+                "चाहिए", "बजे", "मेरा", "मेरी", "मेरे", "आप", "आपका", "हूँ", "हूं", "और", "या",
+                "कहाँ", "कहां", "कैसे", "दीजिए", "बताइए", "करना", "करनी", "था", "थी", "गया"}
 _ROMAN_HINDI_WORDS = {
-    "hai", "hain", "hoon", "hun", "kya", "kaun", "kab", "kahan", "kaise",
-    "kyun", "mujhe", "muje", "mera", "meri", "mere", "aap", "aapka", "aapko",
-    "hum", "humein", "karna", "karni", "karo", "karein", "chahiye", "chahie",
-    "ko", "ke", "ka", "ki", "se", "tak", "nahin", "nahi", "haan", "ji",
-    "dijiye", "batao", "bataiye", "milenge", "milega", "wale", "wala", "kitne",
+    "hai", "hain", "hoon", "hun", "kya", "kaun", "kab", "kahan", "kaise", "kyun", "mujhe", "muje",
+    "mera", "meri", "mere", "aap", "aapka", "aapko", "hum", "humein", "karna", "karni", "karo",
+    "karein", "chahiye", "chahie", "ko", "ke", "ki", "se", "tak", "nahin", "haan", "dijiye",
+    "batao", "bataiye", "milenge", "milega", "wale", "wala", "kitne",
 }
 _ROMAN_MARATHI_WORDS = {
-    "aahe", "ahe", "aahet", "ahet", "aahes", "kon", "kay", "kasa", "kashi",
-    "kadhi", "kuthe", "mala", "mla", "amhi", "tumhi", "tumhala", "pahije",
-    "havi", "hava", "karaychi", "karaycha", "karayche", "sanga",
-    "sangal", "dya", "ahat", "aahat", "cha", "chi", "che", "chya", "la",
-    "madhe", "madhye", "hoil", "nahi", "ho", "somvari", "mangalvari",
-    "budhvari", "guruvari", "shukravari", "shanivari", "ravivari", "udya",
-    "kiti", "yetil", "vajta", "vajata", "bheta", "bhetel", "bhetatil",
+    "aahe", "ahe", "aahet", "ahet", "aahes", "kon", "kay", "kasa", "kashi", "kadhi", "kuthe", "mala",
+    "mla", "amhi", "tumhi", "tumhala", "pahije", "havi", "hava", "karaychi", "karaycha", "karayche",
+    "sanga", "sangal", "dya", "ahat", "aahat", "cha", "chi", "che", "chya", "la", "madhe", "madhye",
+    "hoil", "somvari", "mangalvari", "budhvari", "guruvari", "shukravari", "shanivari", "ravivari",
+    "udya", "kiti", "yetil", "vajta", "vajata", "bheta", "bhetel", "bhetatil",
 }
-# Everyday English words. Names ("Dr Harish Menon") and words shared with
-# romanised Hindi ("appointment", "book") are left out on purpose.
 _ENGLISH_WORDS = {
-    "the", "is", "are", "am", "was", "what", "which", "who", "when", "where",
-    "how", "why", "can", "could", "would", "will", "do", "does", "i", "my",
-    "me", "you", "your", "an", "of", "for", "to", "on", "in", "at", "there",
-    "this", "that", "it", "please", "want", "need", "have", "has", "with",
-    "from", "and", "or", "yes", "no", "thank", "thanks", "tell", "give",
+    "the", "is", "are", "am", "was", "what", "which", "who", "when", "where", "how", "why", "can",
+    "could", "would", "will", "do", "does", "i", "my", "me", "you", "your", "an", "of", "for",
+    "to", "on", "in", "at", "there", "this", "that", "it", "please", "want", "need", "have",
+    "has", "with", "from", "and", "or", "yes", "no", "thank", "thanks", "tell", "give",
 }
-# Words used in both Hindi and Marathi, so they decide neither.
-_ROMAN_SHARED = {"nahi", "ho", "ka"}
 
 
 def detect_language(text, previous="English"):
-    """English, Hindi or Marathi. Devanagari text is Marathi when it carries
-    a Marathi-only word or letter, otherwise Hindi. Text in English letters
-    is Hindi or Marathi when it has at least two of that language's common
-    words (so a single "ko" or "la" in English does not switch language),
-    and English when it has at least two everyday English words. Anything
-    else ("Ramesh Patil", "Dr Harish Menon", "haan", a phone number) keeps
-    the language the call was already using."""
-    if re.search(r"[\u0900-\u097F]", text):
-        return "Marathi" if any(m in text for m in _MARATHI_MARKERS) else "Hindi"
+    """English, Hindi or Marathi, from the caller's words.
+    Devanagari: Marathi when Marathi words outnumber Hindi ones, Hindi when
+    the reverse, otherwise the call's language so far (a name like
+    'गणेश शिंदे' says nothing about the language). English letters:
+    romanised Hindi/Marathi needs two of its common words; English needs two
+    everyday English words; anything else keeps the call's language."""
+    text = bf.to_devanagari(text or "")
+    if re.search(r"[ऀ-ॿ]", text):
+        words = set(re.findall(r"[ऀ-ॿ]+", text))
+        marathi = len(words & _MARATHI_WORDS) + sum(1 for p in _MARATHI_PARTS if p in text + " ")
+        hindi = len(words & _HINDI_WORDS)
+        if marathi > hindi:
+            return "Marathi"
+        if hindi > marathi:
+            return "Hindi"
+        return previous if previous in ("Hindi", "Marathi") else "Hindi"
     words = re.findall(r"[a-z]+", text.lower())
-    hindi = sum(1 for w in words if w in _ROMAN_HINDI_WORDS and w not in _ROMAN_SHARED)
-    marathi = sum(1 for w in words if w in _ROMAN_MARATHI_WORDS and w not in _ROMAN_SHARED)
+    hindi = sum(1 for w in words if w in _ROMAN_HINDI_WORDS)
+    marathi = sum(1 for w in words if w in _ROMAN_MARATHI_WORDS)
     if max(hindi, marathi) >= 2:
         return "Marathi" if marathi >= hindi else "Hindi"
     if sum(1 for w in words if w in _ENGLISH_WORDS) >= 2:
@@ -1274,22 +752,111 @@ def detect_language(text, previous="English"):
     return previous
 
 
-# Ways a caller says yes, in English, Hindi and Marathi (either script).
-_YES_WORDS = {
-    "yes", "yeah", "yep", "ok", "okay", "sure", "confirm", "confirmed", "correct",
-    "right", "haan", "han", "ha", "haa", "ji", "theek", "thik", "ho", "hoy",
-    "hoye", "barobar", "chalel", "हाँ", "हां", "हा", "जी", "ठीक", "हो", "होय",
-    "बरोबर", "चालेल", "सही",
+_ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_CLOCK = re.compile(r"\b0?(\d{1,2}):(\d{2})\s?(AM|PM)\b")
+
+
+def standardize_reply(text, language):
+    """Make every spoken reply follow the same standards, whatever the model
+    wrote: 'Doctor'/'डॉक्टर' in full, one spelling per doctor, no ISO dates,
+    no lists, never Gujarati letters."""
+    s = bf.to_devanagari(text or "").strip()
+    s = s.replace("डोक्टर", "डॉक्टर").replace("डाक्टर", "डॉक्टर")
+    s = s.replace("**", "").replace("__", "")
+    lines = [re.sub(r"^\s*(?:\d+[.)]|[-*•])\s*", "", l).strip() for l in s.splitlines()]
+    s = "; ".join(l.rstrip(";") for l in lines if l)
+    for key, dev in bf.DOCTOR_NAMES_DEVANAGARI.items():
+        latin = key.replace("DR. ", "")
+        pattern = re.compile(r"(?:\b(?:dr|doctor)\.?\s+)?" + re.escape(latin), re.IGNORECASE)
+        s = pattern.sub(bf.say_doctor(key, "English" if language == "English" else language), s)
+        if language != "English":
+            s = re.sub(r"(?:डॉ\.?|डा\.|डॉक्टर)\s*" + re.escape(dev), "डॉक्टर " + dev, s)
+    s = re.sub(r"\b[Dd][Rr]\.?\s+(?=[A-Za-z])", "Doctor ", s)
+    s = re.sub(r"डॉ\.\s*|डॉ\s+(?=[ऀ-ॿ])|डा\.\s*", "डॉक्टर ", s)
+    s = re.sub(r"डॉक्टर\s+डॉक्टर", "डॉक्टर", s)
+    # Any doctor the model named with its own spelling gets the one official
+    # spelling ("डॉक्टर मीरा पिल्लई" -> "डॉक्टर मीरा पिल्लै").
+    def _canonical(m):
+        keys = bf.find_doctors(m.group(2))
+        return bf.say_doctor(keys[0], language) if len(keys) == 1 else m.group(0)
+    if language == "English":
+        s = re.sub(r"\b(Doctor)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", _canonical, s)
+    else:
+        s = re.sub(r"(डॉक्टर)\s+([ऀ-ॿ]+(?:\s+[ऀ-ॿ]+)?)", _canonical, s)
+    s = re.sub(r"\bDoctor\s+Doctor\b", "Doctor", s)
+    s = _ISO_DATE.sub(lambda m: bf.say_date(date(int(m[1]), int(m[2]), int(m[3])), language), s)
+    if language == "English":
+        s = _CLOCK.sub(lambda m: bf.say_time(datetime.strptime(f"{m[1]}:{m[2]} {m[3]}", "%I:%M %p").time(), "English"), s)
+    return re.sub(r"\s{2,}", " ", s).strip()
+
+
+_ERROR_REPLY = {
+    "English": "I'm sorry, I'm having a little trouble right now. Please try again in a moment.",
+    "Hindi": "माफ़ कीजिए, अभी थोड़ी दिक्कत आ रही है। कृपया थोड़ी देर में फिर से कोशिश कीजिए।",
+    "Marathi": "माफ करा, सध्या थोडी अडचण येत आहे. कृपया थोड्या वेळाने पुन्हा प्रयत्न करा.",
 }
 
-def is_confirmation(text):
-    """True when the caller's message says yes."""
-    words = re.findall(r"[a-z]+|[\u0900-\u097F]+", text.lower())
-    return any(w in _YES_WORDS for w in words)
+# ---------------------------------------------------------------------------
+# 9. AGENT CLASS
+# ---------------------------------------------------------------------------
+_TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_doctors_on_day",
+        "description": "Doctors sitting on one day for one department, with their hours. Without a department it returns the departments open that day.",
+        "parameters": {"type": "object", "properties": {
+            "day": {"type": "string", "description": "The day as the caller said it: today, tomorrow, a weekday (Tuesday), next Friday, or a date such as 2 October."},
+            "department": {"type": "string", "description": "Department in English, or the caller's own words for it (skin, teeth, kidney, bones...). Empty for all."},
+        }, "required": ["day"]}}},
+    {"type": "function", "function": {
+        "name": "get_doctor_schedule",
+        "description": "The days of the week and hours one doctor sits. Use for 'when / on which days is Doctor X available'.",
+        "parameters": {"type": "object", "properties": {
+            "doctor": {"type": "string", "description": "The doctor's name as the caller said it."},
+        }, "required": ["doctor"]}}},
+    {"type": "function", "function": {
+        "name": "get_free_slots",
+        "description": "Free 30-minute appointment times with one doctor on one day.",
+        "parameters": {"type": "object", "properties": {
+            "doctor": {"type": "string"},
+            "day": {"type": "string", "description": "The day as the caller said it."},
+        }, "required": ["doctor", "day"]}}},
+    {"type": "function", "function": {
+        "name": "start_booking",
+        "description": "Start booking an appointment. Call as soon as the caller wants to book. Pass anything already mentioned; leave the rest empty.",
+        "parameters": {"type": "object", "properties": {
+            "doctor": {"type": "string"}, "department": {"type": "string"},
+            "day": {"type": "string"}, "time": {"type": "string"},
+        }, "required": []}}},
+    {"type": "function", "function": {
+        "name": "get_my_appointment",
+        "description": "Look up one booking. Needs both the booking ID and the mobile number.",
+        "parameters": {"type": "object", "properties": {
+            "booking_id": {"type": "string"}, "phone": {"type": "string"},
+        }, "required": ["booking_id", "phone"]}}},
+    {"type": "function", "function": {
+        "name": "cancel_my_appointment",
+        "description": "Cancel one booking after the caller has said yes to cancelling it. Needs both the booking ID and the mobile number.",
+        "parameters": {"type": "object", "properties": {
+            "booking_id": {"type": "string"}, "phone": {"type": "string"},
+        }, "required": ["booking_id", "phone"]}}},
+]
+
+_EXTRACT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "intent": {"type": "string", "enum": ["answer", "question", "stop"]},
+        "name": {"type": "string"}, "phone": {"type": "string"},
+        "doctor": {"type": "string", "enum": [""] + list(bf.DOCTOR_NAMES_DEVANAGARI)},
+        "date": {"type": "string"}, "time": {"type": "string"}, "reason": {"type": "string"},
+    },
+    "required": ["intent", "name", "phone", "doctor", "date", "time", "reason"],
+}
 
 
 class HospitalReceptionistAgent:
     _MAX_HISTORY = 50   # max non-system messages to keep; ~25 full call turns
+    _MAX_TOOL_ROUNDS = 3
 
     def __init__(self, model="gpt-4o-mini"):
         if not OPENAI_API_KEY.strip():
@@ -1298,231 +865,10 @@ class HospitalReceptionistAgent:
                 "Set it before starting the server."
             )
         self.client = OpenAI(api_key=OPENAI_API_KEY)
-        self.model  = model
+        self.model = model
         self.conversation_history = [{"role": "system", "content": build_system_prompt()}]
         self.language = "English"   # the call's language so far; see detect_language
-        self.tools  = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "check_appointment_status",
-                    "description": (
-                        "Check a patient's upcoming appointments using their Patient ID "
-                        "or phone number. Searches both the hospital database and live "
-                        "booking records."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "patient_id": {
-                                "type": "string",
-                                "description": "The patient's ID number or registered phone number.",
-                            }
-                        },
-                        "required": ["patient_id"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "book_appointment",
-                    "description": (
-                        "Book an OPD appointment for a patient. "
-                        "The consultant_name field accepts partial or informal names "
-                        "and department names — the system resolves them automatically. "
-                        "All six fields are required."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "patient_name": {
-                                "type": "string",
-                                "description": "Full name of the patient.",
-                            },
-                            "phone_number": {
-                                "type": "string",
-                                "description": "Patient's contact phone number.",
-                            },
-                            "date_str": {
-                                "type": "string",
-                                "description": "Appointment date in YYYY-MM-DD format.",
-                            },
-                            "time_str": {
-                                "type": "string",
-                                "description": "Appointment time in HH:MM AM/PM format, e.g. 10:00 AM.",
-                            },
-                            "purpose": {
-                                "type": "string",
-                                "description": "Reason or purpose of the patient's visit.",
-                            },
-                            "consultant_name": {
-                                "type": "string",
-                                "description": (
-                                    "Doctor's name as spoken by the patient. "
-                                    "Partial names, last names only, and department "
-                                    "names are all accepted."
-                                ),
-                            },
-                        },
-                        "required": [
-                            "patient_name", "phone_number", "date_str",
-                            "time_str", "purpose", "consultant_name",
-                        ],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_appointment_by_booking_id",
-                    "description": (
-                        "Retrieve an existing appointment record using a booking ID "
-                        f"(format: {BOOKING_ID_FORMAT}) or the patient's registered "
-                        "phone number."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "booking_id": {
-                                "type": "string",
-                                "description": "The booking ID issued at the time of confirmation.",
-                            },
-                            "phone_number": {
-                                "type": "string",
-                                "description": "The patient's registered phone number as an alternative.",
-                            },
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_web",
-                    "description": "Search the internet for general information not covered by the FAQs.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "The search query string.",
-                            }
-                        },
-                        "required": ["query"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_url_context",
-                    "description": "Read and return the text content of a specific webpage URL.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "The full URL of the webpage to fetch.",
-                            }
-                        },
-                        "required": ["url"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "cancel_appointment",
-                    "description": (
-                        "Cancel a confirmed appointment using its booking ID. "
-                        "Only call this after the patient has confirmed they want to cancel."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "booking_id": {
-                                "type": "string",
-                                "description": f"The booking ID to cancel (format: {BOOKING_ID_FORMAT}).",
-                            }
-                        },
-                        "required": ["booking_id"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_available_slots",
-                    "description": (
-                        "Show a doctor's OPD time window for a given date and list "
-                        "any already-booked times so the patient can choose a free slot."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "doctor_name": {
-                                "type": "string",
-                                "description": "Doctor's name or department as spoken by the patient.",
-                            },
-                            "date_str": {
-                                "type": "string",
-                                "description": (
-                                    "The day as the caller said it (Tuesday, next "
-                                    "Friday, tomorrow) or a YYYY-MM-DD date. The result "
-                                    "states the exact date; quote it, never calculate one."
-                                ),
-                            },
-                        },
-                        "required": ["doctor_name", "date_str"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_doctors_on_day",
-                    "description": (
-                        "List the doctors sitting on one day with their department "
-                        "and OPD timings, optionally for one department only. Call "
-                        "this before naming any doctor for a day or department."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "day": {
-                                "type": "string",
-                                "description": (
-                                    "The day in English as the caller said it: today, "
-                                    "tomorrow, a weekday (Tuesday), or next Friday. Give "
-                                    "a YYYY-MM-DD date only when the caller named a "
-                                    "specific date. The result states the exact date; "
-                                    "quote that date, never calculate one."
-                                ),
-                            },
-                            "department": {
-                                "type": "string",
-                                "description": (
-                                    "Optional. Department in English (never Hindi or "
-                                    "Marathi) as in the doctors "
-                                    "list. Everyday words: kidney = Nephrology (kidney "
-                                    "stones or urine problems = Urology), skin = "
-                                    "Dermatology, bones or joints = Orthopaedics, eyes = "
-                                    "Ophthalmology, teeth = Dental, ear/nose/throat = ENT, "
-                                    "stomach or digestion = Medical Gastroenterology, "
-                                    "women's health or pregnancy = Gynaecology, brain or "
-                                    "nerves = Neurology, cancer = Oncology, sugar or "
-                                    "thyroid = Endocrinology, liver = Liver Clinic. "
-                                    "Leave empty for all departments."
-                                ),
-                            },
-                        },
-                        "required": ["day"],
-                    },
-                },
-            },
-        ]
+        self.booking = None         # a BookingFlow while a booking is in progress
 
     def _trim_history(self):
         """Drop oldest non-system messages once the history exceeds _MAX_HISTORY.
@@ -1532,145 +878,149 @@ class HospitalReceptionistAgent:
         if len(rest) <= self._MAX_HISTORY:
             return
         tail = rest[-self._MAX_HISTORY:]
-        # Advance to the first user message so we never start mid-tool-chain
-        i = next((j for j, m in enumerate(tail) if m.get("role") == "user"), 0)
+        i = next((j for j, m in enumerate(tail) if isinstance(m, dict) and m.get("role") == "user"), 0)
         self.conversation_history = [self.conversation_history[0]] + tail[i:]
 
+    # -- the model as a fallback to read one booking detail -------------------
+    def _extract(self, text, expect, language):
+        today = bf.today_ist()
+        days = "; ".join(f"{bf.say_date(today + bf.timedelta(days=i), 'English')} = "
+                         f"{(today + bf.timedelta(days=i)).isoformat()}" for i in range(0, 15))
+        doctors = "; ".join(f"{k} = {bf.DOCTOR_NAMES_DEVANAGARI[k]}" for k in bf.DOCTOR_NAMES_DEVANAGARI)
+        instructions = (
+            "Extract appointment details from one thing a hospital caller said. "
+            f"The receptionist had just asked for: {expect}. Today is {today.isoformat()}; "
+            f"the next days are: {days}. Doctors (key = Devanagari name): {doctors}. "
+            "Return empty strings for anything not said. date as YYYY-MM-DD, time as 24-hour HH:MM, "
+            "phone as digits only, doctor as one of the keys. intent is 'question' if the caller asked "
+            "something instead of answering, 'stop' if they do not want to book, else 'answer'.")
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": instructions},
+                          {"role": "user", "content": text}],
+                response_format={"type": "json_schema", "json_schema": {
+                    "name": "booking_details", "strict": True, "schema": _EXTRACT_SCHEMA}},
+            )
+            return json.loads(response.choices[0].message.content)
+        except Exception:
+            traceback.print_exc()
+            sys.stderr.flush()
+            return {}
+
+    # -- tools ----------------------------------------------------------------
+    def _run_tool(self, name, args, user_input, language):
+        if name == "get_doctors_on_day":
+            return get_doctors_on_day(args.get("day", ""), args.get("department", ""), language)
+        if name == "get_doctor_schedule":
+            return get_doctor_schedule(args.get("doctor", ""), language)
+        if name == "get_free_slots":
+            return get_free_slots(args.get("doctor", ""), args.get("day", ""), language)
+        if name == "get_my_appointment":
+            return get_my_appointment(args.get("booking_id", ""), args.get("phone", ""), language)
+        if name == "cancel_my_appointment":
+            if bf.classify_yes_no(user_input, ignore=("cancel", "कैंसल", "रद्द")) != "yes":
+                return ("Not cancelled yet. Read the booking back to the caller and ask yes or no; "
+                        "call cancel_my_appointment only after they say yes.")
+            status, record = cancel_booking(args.get("booking_id", ""), args.get("phone", ""))
+            if status == "not_found":
+                return "No upcoming booking was found with that booking ID and mobile number."
+            if status == "already":
+                return "That booking was already cancelled."
+            return "Cancelled. " + describe_booking(record, language)
+        return f"Error: Tool '{name}' is not registered."
+
+    def _start_booking(self, args, user_input, language):
+        flow = bf.BookingFlow(_CORE, extractor=self._extract)
+        hint = " ".join(v for v in (args.get("doctor"), args.get("department")) if v) or user_input
+        keys = bf.find_doctors(hint)
+        if len(keys) != 1:
+            depts = bf.find_departments(hint)
+            keys = bf.doctors_in_departments(_CORE, depts) if depts and not keys else keys
+        if len(keys) == 1:
+            flow.f["doctor"] = keys[0]
+            day = bf.parse_date(args.get("day") or "") or bf.parse_date(user_input)
+            if day:
+                flow._set_date(day, language)
+                if "date" in flow.f:
+                    t = bf.parse_time(args.get("time") or "")
+                    if t:
+                        flow._set_time(t, language)
+        elif len(keys) > 1:
+            flow.options = keys
+        self.booking = flow
+        return flow.prompt(language)
+
+    # -- one caller turn ------------------------------------------------------
     def process_user_input(self, user_input: str) -> str:
         # Remember where this turn starts so a failure can be rolled back.
         # Otherwise a half-finished tool call stays in the history and every
         # later OpenAI request for this caller is rejected.
         turn_start = len(self.conversation_history)
-        self.conversation_history.append({"role": "user", "content": user_input})
-        # Stated fresh each turn and never stored, so the reply language
-        # follows the caller rather than the prompt's Hindi/Marathi examples.
-        language = self.language = detect_language(user_input, self.language)
-        said_day = weekday_in_text(user_input)
-
-        def caller_day(model_day):
-            """The model sometimes turns a weekday into the wrong date
-            (Wednesday -> a Monday). When the caller named a weekday in
-            this message and the model's day disagrees, use the caller's."""
-            if said_day and resolve_day(model_day)[0] != said_day.split()[-1]:
-                print(f"--- System: day '{model_day}' replaced by caller's '{said_day}' ---")
-                return said_day
-            return model_day
-
-        language_note = {"role": "system", "content": f"Reply language: {language}."}
+        text = bf.to_devanagari(user_input or "").strip()
+        language = self.language = detect_language(text, self.language)
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.conversation_history + [language_note],
-                tools=self.tools,
-                tool_choice="auto",
-            )
-            response_message = response.choices[0].message
-
-            if response_message.tool_calls:
-                self.conversation_history.append(response_message)
-
-                for tool_call in response_message.tool_calls:
-                    fn_name = tool_call.function.name
-                    fn_args = json.loads(tool_call.function.arguments)
-
-                    if fn_name == "check_appointment_status":
-                        fn_result = check_appointment_status(
-                            patient_id=fn_args.get("patient_id")
-                        )
-                    elif fn_name == "book_appointment" and not is_confirmation(user_input):
-                        # The model once booked straight after hearing the
-                        # doctor's name. Booking needs the caller's yes.
-                        print("--- System: booking held until the caller confirms ---")
-                        fn_result = (
-                            "Not booked yet. Read all six details back to the caller "
-                            "and ask for a yes or no. Call book_appointment only after "
-                            "the caller says yes.")
-                    elif fn_name == "book_appointment":
-                        fn_result = book_appointment(
-                            patient_name=fn_args.get("patient_name"),
-                            phone_number=fn_args.get("phone_number"),
-                            date_str=fn_args.get("date_str"),
-                            time_str=fn_args.get("time_str"),
-                            purpose=fn_args.get("purpose"),
-                            consultant_name=fn_args.get("consultant_name"),
-                        )
-                    elif fn_name == "get_appointment_by_booking_id":
-                        fn_result = get_appointment_by_booking_id(
-                            booking_id=fn_args.get("booking_id", ""),
-                            phone_number=fn_args.get("phone_number", ""),
-                        )
-                    elif fn_name == "search_web":
-                        fn_result = search_web(query=fn_args.get("query"))
-                    elif fn_name == "get_url_context":
-                        fn_result = get_url_context(url=fn_args.get("url"))
-                    elif fn_name == "cancel_appointment":
-                        fn_result = cancel_appointment(
-                            booking_id=fn_args.get("booking_id", ""),
-                        )
-                    elif fn_name == "list_available_slots":
-                        fn_result = list_available_slots(
-                            doctor_name=fn_args.get("doctor_name", ""),
-                            date_str=caller_day(fn_args.get("date_str", "")),
-                            language=language,
-                        )
-                    elif fn_name == "get_doctors_on_day":
-                        fn_result = get_doctors_on_day(
-                            day=caller_day(fn_args.get("day", "")),
-                            department=fn_args.get("department", ""),
-                            language=language,
-                        )
-                    else:
-                        fn_result = f"Error: Tool '{fn_name}' is not registered."
-
-                    self.conversation_history.append({
-                        "tool_call_id": tool_call.id,
-                        "role":         "tool",
-                        "name":         fn_name,
-                        "content":      fn_result,
-                    })
-
-                second_response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self.conversation_history + [language_note],
-                )
-                final_answer = second_response.choices[0].message.content
-                self.conversation_history.append(
-                    {"role": "assistant", "content": final_answer}
-                )
-                self._trim_history()
-                return final_answer
-
+            if self.booking is not None:
+                reply, status = self.booking.handle(text, language)
+                if status == "question":
+                    answer = self._chat(text, language)
+                    reply = answer + " " + bf.TEXT["continue"][language].format(
+                        prompt=self.booking.prompt(language))
+                else:
+                    self.conversation_history.append({"role": "user", "content": text})
+                    self.conversation_history.append({"role": "assistant", "content": reply})
+                if self.booking.done:
+                    self.booking = None
             else:
-                final_answer = response_message.content
-                self.conversation_history.append(
-                    {"role": "assistant", "content": final_answer}
-                )
-                self._trim_history()
-                return final_answer
-
+                reply = self._chat(text, language)
+            self._trim_history()
+            return standardize_reply(reply, language)
         except Exception:
             # The technical error goes to the server log, never to the caller:
             # the phone reads replies aloud to patients.
             traceback.print_exc()
             sys.stderr.flush()
             del self.conversation_history[turn_start:]
-            return (
-                "I'm sorry, I'm having a little trouble connecting right now. "
-                "Please try again in a moment."
-            )
+            return _ERROR_REPLY[language]
+
+    def _chat(self, text, language):
+        """The model answers (FAQ, schedule questions) or starts a booking.
+        It may look things up up to three times in one turn."""
+        self.conversation_history.append({"role": "user", "content": text})
+        # Stated fresh each turn and never stored, so the reply language
+        # follows the caller.
+        note = {"role": "system", "content": f"Reply language: {language}."}
+        for round_no in range(self._MAX_TOOL_ROUNDS + 1):
+            use_tools = round_no < self._MAX_TOOL_ROUNDS
+            kwargs = {"tools": _TOOLS, "tool_choice": "auto"} if use_tools else {}
+            response = self.client.chat.completions.create(
+                model=self.model, messages=self.conversation_history + [note], **kwargs)
+            message = response.choices[0].message
+            if not getattr(message, "tool_calls", None):
+                reply = message.content or ""
+                self.conversation_history.append({"role": "assistant", "content": reply})
+                return reply
+            self.conversation_history.append(message)
+            booking_reply = None
+            for call in message.tool_calls:
+                args = json.loads(call.function.arguments or "{}")
+                if call.function.name == "start_booking":
+                    booking_reply = self._start_booking(args, text, language)
+                    result = "Booking started. The booking steps will now ask the caller for the details."
+                else:
+                    result = self._run_tool(call.function.name, args, text, language)
+                self.conversation_history.append({
+                    "tool_call_id": call.id, "role": "tool",
+                    "name": call.function.name, "content": result,
+                })
+            if booking_reply is not None:
+                self.conversation_history.append({"role": "assistant", "content": booking_reply})
+                return booking_reply
+        return ""
 
 
 # ---------------------------------------------------------------------------
-# 12. NOTE ON USAGE
-#     The old desktop files imported a single global `root_agent`.
-#     The server (app.py) now creates one HospitalReceptionistAgent per
-#     caller session, so each phone call keeps its own conversation history.
-#     ADKBridge is kept only for backward compatibility with the old
-#     desktop voice_caller.py, and is created on demand, not at import.
+# 10. NOTE ON USAGE
 # ---------------------------------------------------------------------------
-class ADKBridge:
-    def __init__(self):
-        self.agent = HospitalReceptionistAgent()
-
-    def __call__(self, user_input: str) -> str:
-        return self.agent.process_user_input(user_input)
+# The server (app.py) creates one HospitalReceptionistAgent per caller session
+# and calls process_user_input() once per caller turn.

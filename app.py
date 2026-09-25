@@ -11,13 +11,6 @@ POST /api/session/start     -> {"session_id": "..."} and the greeting text
 POST /api/chat              -> body {"session_id": "...", "message": "..."}
                                returns {"reply": "..."}
 POST /api/session/end       -> body {"session_id": "..."}; frees the session
-POST /api/voice?session_id= -> body: the caller's recorded speech (WAV)
-                               returns {"heard": "...", "reply": "..."}; the
-                               language (English/Hindi/Marathi) is detected
-POST /api/tts               -> body {"text": "...", "language": "Marathi"}
-                               returns MP3 audio (Smallest.ai voice)
-GET  /api/tts?text=...      -> same, for trying a voice in a browser
-GET  /voices                -> page with sample phrases in each language
 
 Run on Windows Server:
     set OPENAI_API_KEY=sk-...        (Command Prompt)
@@ -30,15 +23,10 @@ import threading
 import time
 import uuid
 
-from html import escape
-from urllib.parse import quote
-
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 
 import agent_core
 import booking_sync
-import stt
-import tts
 
 app = Flask(__name__)
 
@@ -86,9 +74,22 @@ def assets(filename):
     )
 
 
+# Optional device key. When DEVICE_KEY is set (Railway variable), every
+# /api/ request except the health check must carry it in the X-Device-Key
+# header, so only the reception phones can use the desk and its paid APIs.
+DEVICE_KEY = os.environ.get("DEVICE_KEY", "").strip()
+
+
+@app.before_request
+def check_device_key():
+    if DEVICE_KEY and request.path.startswith("/api/") and request.path != "/api/health":
+        if request.headers.get("X-Device-Key", "") != DEVICE_KEY:
+            return jsonify({"error": "Not allowed."}), 401
+
+
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", **booking_sync.status()})
 
 
 @app.post("/api/session/start")
@@ -113,23 +114,6 @@ def chat():
     return jsonify({"session_id": session_id, "reply": reply})
 
 
-@app.post("/api/voice")
-def voice():
-    """One caller turn from recorded audio: speech -> text (Pulse, language
-    detected automatically) -> the receptionist's reply."""
-    session_id = (request.args.get("session_id") or "").strip()
-    try:
-        heard = stt.transcribe(request.get_data())
-    except Exception as e:                      # Pulse unreachable or refused
-        print(f"--- STT error: {type(e).__name__}: {e} ---", flush=True)
-        return jsonify({"error": "Could not hear that right now."}), 502
-    print(f"--- Heard: {heard!r} ---", flush=True)
-    if not heard:
-        return jsonify({"session_id": session_id, "heard": "", "reply": ""})
-    session_id, reply = _answer(session_id, heard)
-    return jsonify({"session_id": session_id, "heard": heard, "reply": reply})
-
-
 def _answer(session_id, message):
     with _lock:
         agent = _sessions.get(session_id)
@@ -143,70 +127,6 @@ def _answer(session_id, message):
     # The OpenAI call happens outside the lock so one slow call
     # does not block every other caller.
     return session_id, agent.process_user_input(message)
-
-
-@app.route("/api/tts", methods=["GET", "POST"])
-def text_to_speech():
-    data = (request.get_json(silent=True) or {}) if request.method == "POST" else request.args
-    text = (data.get("text") or "").strip()
-    language = (data.get("language") or data.get("lang") or "").strip().capitalize() or None
-    voice_id = (data.get("voice") or "").strip().lower() or None
-    try:
-        audio = tts.synthesize(text, language, voice_id)
-    except tts.TtsError as e:
-        print(f"--- TTS error: {e} ---", flush=True)
-        return jsonify({"error": "Voice is not available right now."}), 502
-    except Exception as e:                        # network trouble reaching Smallest.ai
-        print(f"--- TTS error: {type(e).__name__}: {e} ---", flush=True)
-        return jsonify({"error": "Voice is not available right now."}), 502
-    return Response(audio, mimetype="audio/mpeg")
-
-
-VOICE_SAMPLES = [
-    ("English", GREETING),
-    ("English", "Dr. Neha Kapadia is available on Monday from 9 AM to 1 PM."),
-    ("Hindi", "नमस्ते, अस्पताल रिसेप्शन डेस्क में आपका स्वागत है। मैं आपकी क्या सहायता कर सकती हूँ?"),
-    ("Hindi", "डॉ. विक्रम देसाई सोमवार को उपलब्ध हैं। उनका समय सुबह 9 बजे से दोपहर 1 बजे तक है।"),
-    ("Marathi", "नमस्कार, रुग्णालय स्वागत कक्षात आपले स्वागत आहे. मी आपली काय मदत करू शकते?"),
-    ("Marathi", "डॉ. नेहा कपाडिया सोमवारी उपलब्ध आहेत. त्यांची वेळ सकाळी ९ ते दुपारी १ पर्यंत आहे."),
-]
-
-
-# The same three sentences for every voice, so voices can be compared.
-COMPARE_SENTENCES = [
-    ("English", "Hello, welcome to the Hospital Reception Desk. Dr. Neha Kapadia is available on Monday from 9 AM to 1 PM."),
-    ("Hindi", "नमस्ते, अस्पताल रिसेप्शन डेस्क में आपका स्वागत है। डॉ. नेहा कपाडिया सोमवार को सुबह 9 बजे से दोपहर 1 बजे तक उपलब्ध हैं।"),
-    ("Marathi", "नमस्कार, रुग्णालय स्वागत कक्षात आपले स्वागत आहे. डॉ. नेहा कपाडिया सोमवारी सकाळी ९ ते दुपारी १ पर्यंत उपलब्ध आहेत."),
-]
-
-
-@app.get("/voices/compare")
-def voices_compare():
-    blocks = []
-    for voice in tts.SAMPLE_VOICES:
-        rows = "".join(
-            f"<p><b>{lang}</b><br><audio controls preload='none' "
-            f"src='/api/tts?voice={voice}&amp;lang={lang}&amp;text={quote(text)}'></audio></p>"
-            for lang, text in COMPARE_SENTENCES)
-        blocks.append(f"<section style='border:1px solid #ccc;border-radius:8px;padding:8px 12px;margin:12px 0'>"
-                      f"<h2 style='margin:4px 0'>{escape(voice)}</h2>{rows}</section>")
-    return (f"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
-            f"<title>Compare voices</title><body style='font-family:sans-serif;max-width:640px;"
-            f"margin:auto;padding:16px'><h1>One voice for all three languages</h1>"
-            f"<p>Each voice says the same sentence in English, Hindi and Marathi. "
-            f"A player that does not play means that voice cannot speak that language.</p>"
-            f"{''.join(blocks)}</body>")
-
-
-@app.get("/voices")
-def voices_page():
-    rows = "".join(
-        f"<h3>{escape(lang)} · {escape(tts.VOICES[lang]['voice_id'])}</h3><p>{escape(text)}</p>"
-        f"<audio controls preload='none' src='/api/tts?lang={lang}&amp;text={quote(text)}'></audio>"
-        for lang, text in VOICE_SAMPLES)
-    return (f"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
-            f"<title>Voice samples</title><body style='font-family:sans-serif;max-width:640px;"
-            f"margin:auto;padding:16px'><h1>Reception desk voices</h1>{rows}</body>")
 
 
 @app.post("/api/session/end")

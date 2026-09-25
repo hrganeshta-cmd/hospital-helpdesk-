@@ -11,6 +11,10 @@ Railway variables:
     BOOKING_SHEET_URL     the Apps Script web app URL (ends in /exec)
     BOOKING_SYNC_SECRET   the secret printed by setup() in the script
 When either is missing, syncing is skipped and the desk works as before.
+
+Until the restore has succeeded, is_ready() is False and the desk takes a
+call-back request instead of a booking, so no booking is ever made against
+an empty database.
 """
 
 import os
@@ -18,6 +22,9 @@ import threading
 import time
 
 import requests
+
+_ready = threading.Event()
+_failing = False          # True after a Sheet write gave up; cleared by the next success
 
 
 def _config():
@@ -30,6 +37,16 @@ def enabled():
     return bool(url and secret)
 
 
+def is_ready():
+    """True once upcoming bookings are loaded (or when no Sheet is set up)."""
+    return _ready.is_set() or not enabled()
+
+
+def status():
+    return {"sheet": "configured" if enabled() else "not configured",
+            "bookings_ready": is_ready(), "sheet_writes_failing": _failing}
+
+
 def _post(payload, timeout=30):
     url, secret = _config()
     response = requests.post(url, json={**payload, "secret": secret}, timeout=timeout)
@@ -40,44 +57,54 @@ def _post(payload, timeout=30):
     return data
 
 
-def _send_with_retries(action, booking, attempts=4):
+def _send_with_retries(action, booking, attempts=6):
+    global _failing
+    label = booking.get("booking_id") or "call-back"
     for attempt in range(1, attempts + 1):
         try:
             _post({"action": action, "booking": booking})
-            print(f"--- Sheet: {action} {booking.get('booking_id')} ---", flush=True)
+            print(f"--- Sheet: {action} {label} ---", flush=True)
+            _failing = False
             return
         except Exception as e:                  # network trouble or a Sheet error
-            print(f"--- Sheet: {action} {booking.get('booking_id')} failed "
-                  f"(attempt {attempt}): {type(e).__name__}: {e} ---", flush=True)
-            time.sleep(2 ** attempt)
-    print(f"--- Sheet: GAVE UP on {action} {booking.get('booking_id')}; "
+            print(f"--- Sheet: {action} {label} failed "
+                  f"(attempt {attempt}): {type(e).__name__} ---", flush=True)
+            time.sleep(2 ** attempt)            # about 2 minutes in total
+    _failing = True
+    print(f"--- Sheet: GAVE UP on {action} {label}; "
           "add it to the Sheet by hand ---", flush=True)
 
 
 def send(action, booking):
-    """Record a booking ("booked") or cancellation ("cancelled") in the Sheet
-    and email the doctor. Runs in the background so the caller never waits."""
+    """Record a booking ("booked"), cancellation ("cancelled") or call-back
+    request ("callback") in the Sheet and email the doctor / reception.
+    Runs in the background so the caller never waits."""
     if not enabled():
         return
     threading.Thread(target=_send_with_retries, args=(action, dict(booking)),
                      daemon=True).start()
 
 
-def restore(save_appointments, doctors):
-    """Give the Sheet the doctor list and load today's and future bookings
-    from it into the local database. Called once when the server starts."""
+def restore(save_appointments, doctors, attempts=None):
+    """Give the Sheet the doctor list and load recent and upcoming bookings
+    from it into the local database. Called once when the server starts; it
+    keeps trying (every minute at most) until it succeeds, and bookings are
+    taken only after that."""
     if not enabled():
         print("--- Sheet: not configured; bookings are kept on this server only ---", flush=True)
+        _ready.set()
         return 0
-    for attempt in range(1, 4):
+    attempt = 0
+    while attempts is None or attempt < attempts:
+        attempt += 1
         try:
             data = _post({"action": "sync", "doctors": doctors}, timeout=60)
             bookings = data.get("bookings", [])
             save_appointments(bookings)
-            print(f"--- Sheet: restored {len(bookings)} upcoming bookings ---", flush=True)
+            _ready.set()
+            print(f"--- Sheet: restored {len(bookings)} bookings ---", flush=True)
             return len(bookings)
         except Exception as e:
-            print(f"--- Sheet: restore failed (attempt {attempt}): "
-                  f"{type(e).__name__}: {e} ---", flush=True)
-            time.sleep(5 * attempt)
+            print(f"--- Sheet: restore failed (attempt {attempt}): {type(e).__name__} ---", flush=True)
+            time.sleep(min(60, 5 * attempt))
     return 0
