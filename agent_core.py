@@ -709,7 +709,35 @@ def display_name(doctor_key):
     return doctor_key.title()
 
 
-def list_available_slots(doctor_name: str, date_str: str) -> str:
+_DEVANAGARI_DIGITS = str.maketrans("0123456789", "०१२३४५६७८९")
+
+def spoken_time(time_str, language):
+    """ "01:30 PM" -> "दुपारी १:३०" (Marathi) or "दोपहर 1:30 बजे" (Hindi).
+    Built in code because the model kept dropping the part of day."""
+    t = parse_time_flexible(time_str)
+    if t is None:
+        return time_str
+    hour12 = t.hour % 12 or 12
+    clock = f"{hour12}:{t.minute:02d}" if t.minute else f"{hour12}"
+    if language == "Marathi":
+        part = ("सकाळी" if t.hour < 12 else "दुपारी" if t.hour < 17
+                else "संध्याकाळी" if t.hour < 20 else "रात्री")
+        return f"{part} {clock.translate(_DEVANAGARI_DIGITS)}"
+    part = ("सुबह" if t.hour < 12 else "दोपहर" if t.hour < 16
+            else "शाम" if t.hour < 20 else "रात")
+    return f"{part} {clock} बजे"
+
+
+def spoken_window(time_from, time_to, language="English"):
+    """A doctor's OPD window as it should be said in the reply language."""
+    if language == "Marathi":
+        return f"{spoken_time(time_from, language)} ते {spoken_time(time_to, language)} पर्यंत"
+    if language == "Hindi":
+        return f"{spoken_time(time_from, language)} से {spoken_time(time_to, language)} तक"
+    return f"{time_from} to {time_to}"
+
+
+def list_available_slots(doctor_name: str, date_str: str, language: str = "English") -> str:
     """
     Return a doctor's OPD window for a given date and highlight any
     already-confirmed bookings within that window.
@@ -738,9 +766,8 @@ def list_available_slots(doctor_name: str, date_str: str) -> str:
         return match["message"]
 
     matched_key, doctor_info = match["matches"][0]
-    window = doctor_info["from"] + (
-        f" to {doctor_info['to']}" if doctor_info["to"] else " onwards"
-    )
+    window = (spoken_window(doctor_info["from"], doctor_info["to"], language)
+              if doctor_info["to"] else doctor_info["from"] + " onwards")
     date_label = appt_date.strftime("%A, %d %B %Y (%Y-%m-%d)")
 
     booked_times = sorted(
@@ -754,13 +781,13 @@ def list_available_slots(doctor_name: str, date_str: str) -> str:
     if booked_times:
         return (
             f"{display_name(matched_key)} ({doctor_info['department'].title()}) is available on "
-            f"{date_label} from {window}. "
+            f"{date_label}, time: {window}. "
             f"Already booked times on that day: {', '.join(booked_times)}. "
             "Any other time within the window can be booked."
         )
     return (
         f"{display_name(matched_key)} ({doctor_info['department'].title()}) is available on "
-        f"{date_label} from {window}. "
+        f"{date_label}, time: {window}. "
         "No appointments have been booked yet — any time in that window is free."
     )
 
@@ -786,7 +813,7 @@ def _best_department_matches(query_words, doctors):
     return {k: doctors[k] for k, sc in scored.items() if best and sc == best}
 
 
-def get_doctors_on_day(day: str, department: str = "") -> str:
+def get_doctors_on_day(day: str, department: str = "", language: str = "English") -> str:
     """
     List the doctors sitting on one day, optionally only one department.
     day is a weekday name (e.g. "Monday") or a date in YYYY-MM-DD format.
@@ -820,10 +847,12 @@ def get_doctors_on_day(day: str, department: str = "") -> str:
                     + ", ".join(sorted({v["department"] for v in DOCTOR_SCHEDULE[day_key].values()}))
                     + ".")
 
-    listing = "; ".join(f"{display_name(k)} ({v['department'].title()}) {v['from']} to {v['to']}"
+    listing = "; ".join(f"{display_name(k)} ({v['department'].title()}) "
+                        f"time: {spoken_window(v['from'], v['to'], language)}"
                         for k, v in doctors.items())
     return (f"Doctors on {day_label}: {listing}. "
-            "These are the only doctors for this request; do not add any other doctor.")
+            "These are the only doctors for this request; do not add any other doctor. "
+            "Say each time exactly as written after 'time:'.")
 
 
 # ---------------------------------------------------------------------------
@@ -1057,7 +1086,8 @@ COMMUNICATION RULES:
    the doctors the tool returned, with the timings it returned.
 9. Only when replying in Marathi or Hindi: speak about a doctor with the
    respectful plural, keep the whole reply in that one language, write names
-   in Devanagari, and say the part of day before each time instead of AM/PM.
+   in Devanagari, and say each time exactly as the tool wrote it after
+   "time:" (it already includes सकाळी/दुपारी or सुबह/दोपहर).
    Marathi pattern: "डॉ. <नाव> <वार> उपलब्ध आहेत. त्यांची वेळ सकाळी <वेळ> ते
    दुपारी <वेळ> पर्यंत आहे." (त्यांची वेळ; never आहे/करते/करतो for a doctor;
    day words सकाळी, दुपारी, संध्याकाळी).
@@ -1388,8 +1418,8 @@ class HospitalReceptionistAgent:
         self.conversation_history.append({"role": "user", "content": user_input})
         # Stated fresh each turn and never stored, so the reply language
         # follows the caller rather than the prompt's Hindi/Marathi examples.
-        language_note = {"role": "system",
-                         "content": f"Reply language: {detect_language(user_input)}."}
+        language = detect_language(user_input)
+        language_note = {"role": "system", "content": f"Reply language: {language}."}
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -1436,11 +1466,13 @@ class HospitalReceptionistAgent:
                         fn_result = list_available_slots(
                             doctor_name=fn_args.get("doctor_name", ""),
                             date_str=fn_args.get("date_str", ""),
+                            language=language,
                         )
                     elif fn_name == "get_doctors_on_day":
                         fn_result = get_doctors_on_day(
                             day=fn_args.get("day", ""),
                             department=fn_args.get("department", ""),
+                            language=language,
                         )
                     else:
                         fn_result = f"Error: Tool '{fn_name}' is not registered."
