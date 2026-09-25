@@ -731,6 +731,59 @@ def list_available_slots(doctor_name: str, date_str: str) -> str:
         "No appointments have been booked yet — any time in that window is free."
     )
 
+
+def _department_matches(query_words, department):
+    """True when a spoken word names the department. The first five letters
+    are compared so spelling variants match (orthopedic / ORTHOPAEDICS)."""
+    dept_words = [w for w in re.split(r"[^A-Z]+", department.upper()) if w]
+    return any(q == d or (len(q) >= 5 and len(d) >= 5 and q[:5] == d[:5])
+               for q in query_words for d in dept_words)
+
+
+def get_doctors_on_day(day: str, department: str = "") -> str:
+    """
+    List the doctors sitting on one day, optionally only one department.
+    day is a weekday name (e.g. "Monday") or a date in YYYY-MM-DD format.
+    Only that day's doctors are returned, so the agent cannot mix in a
+    doctor who sits on a different day.
+    """
+    print(f"--- System: Doctors on '{day}' (department '{department}') ---")
+    day_key = day.strip().upper()
+    try:
+        day_key = datetime.strptime(day.strip(), "%Y-%m-%d").strftime("%A").upper()
+    except ValueError:
+        pass
+
+    if day_key == "SUNDAY":
+        return "Our OPDs are closed on Sundays. Emergency services are available 24 hours."
+    if day_key not in DOCTOR_SCHEDULE:
+        return ("The day was not understood. Please give a weekday name such as "
+                "Monday, or a date in YYYY-MM-DD format.")
+
+    day_label = day_key.capitalize()
+    doctors = DOCTOR_SCHEDULE[day_key]
+    query_words = [w for w in re.split(r"[^A-Z]+", department.upper())
+                   if w and w not in {"DEPARTMENT", "DOCTOR", "DR", "OPD"}]
+    if query_words:
+        doctors = {k: v for k, v in doctors.items()
+                   if _department_matches(query_words, v["department"])}
+        if not doctors:
+            other_days = [d.capitalize() for d, docs in DOCTOR_SCHEDULE.items()
+                          if any(_department_matches(query_words, v["department"])
+                                 for v in docs.values())]
+            if other_days:
+                return (f"No {department} doctor sits on {day_label}. "
+                        f"That department runs on: {', '.join(other_days)}.")
+            return (f"'{department}' was not recognised. Departments on {day_label}: "
+                    + ", ".join(sorted({v["department"] for v in DOCTOR_SCHEDULE[day_key].values()}))
+                    + ".")
+
+    listing = "; ".join(f"{k} ({v['department']}) {v['from']} to {v['to']}"
+                        for k, v in doctors.items())
+    return (f"Doctors on {day_label}: {listing}. "
+            "These are the only doctors for this request; do not add any other doctor.")
+
+
 # ---------------------------------------------------------------------------
 # 9. HOSPITAL FAQ KNOWLEDGE BASE
 # ---------------------------------------------------------------------------
@@ -919,6 +972,13 @@ o	English Q: Can I get a summary of my daily expenses during my stay?
 #     (It used to be fixed once at server start, so a server left running
 #     for weeks resolved "tomorrow" to a date long past.)
 # ---------------------------------------------------------------------------
+# Names and departments only; each doctor's days and timings are looked up
+# through get_doctors_on_day / list_available_slots so they are never guessed.
+DOCTOR_ROSTER_TEXT = "; ".join(sorted(
+    {f"{name} ({info['department']})"
+     for docs in DOCTOR_SCHEDULE.values() for name, info in docs.items()},
+    key=lambda s: s.split("(")[1]))
+
 def build_system_prompt():
     _today_str = date.today().strftime("%A, %d %B %Y")   # e.g., "Tuesday, 07 April 2026"
     return f"""
@@ -941,8 +1001,10 @@ COMMUNICATION RULES:
 6. Respond in the same language the patient uses — English, Hindi, or Marathi.
 7. The caller was already welcomed when the call started. Never greet or
    welcome them again; answer the question directly.
-8. For a specific doctor's or department's timings on a given day, answer from
-   the OPD schedule below (or list_available_slots), not from the general FAQ.
+8. Never name the doctors on a day, or give any doctor's days or timings,
+   from memory. First call get_doctors_on_day (for a day or a department) or
+   list_available_slots (for one named doctor on a date), then mention only
+   the doctors the tool returned, with the timings it returned.
 
 DATE AND TIME INTERPRETATION — MANDATORY:
 - Convert any natural date expression ("tomorrow", "next Monday", "15th April",
@@ -995,8 +1057,8 @@ YYYY-MM-DD format. Resolve any relative date expression first.
 
 {hospital_faqs}
 
-Current OPD schedules for your reference:
-{json.dumps(DOCTOR_SCHEDULE, separators=(",", ":"))}
+Doctors and departments (days and timings come only from the tools):
+{DOCTOR_ROSTER_TEXT}
 """
 
 # ---------------------------------------------------------------------------
@@ -1188,6 +1250,35 @@ class HospitalReceptionistAgent:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_doctors_on_day",
+                    "description": (
+                        "List the doctors sitting on one day with their department "
+                        "and OPD timings, optionally for one department only. Call "
+                        "this before naming any doctor for a day or department."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "day": {
+                                "type": "string",
+                                "description": "Weekday name in English (e.g. Monday) or a date in YYYY-MM-DD format.",
+                            },
+                            "department": {
+                                "type": "string",
+                                "description": (
+                                    "Optional. Department in English as in the doctors "
+                                    "list (e.g. Dermatology for skin, Orthopaedics for "
+                                    "bones). Leave empty for all departments."
+                                ),
+                            },
+                        },
+                        "required": ["day"],
+                    },
+                },
+            },
         ]
 
     def _trim_history(self):
@@ -1254,6 +1345,11 @@ class HospitalReceptionistAgent:
                         fn_result = list_available_slots(
                             doctor_name=fn_args.get("doctor_name", ""),
                             date_str=fn_args.get("date_str", ""),
+                        )
+                    elif fn_name == "get_doctors_on_day":
+                        fn_result = get_doctors_on_day(
+                            day=fn_args.get("day", ""),
+                            department=fn_args.get("department", ""),
                         )
                     else:
                         fn_result = f"Error: Tool '{fn_name}' is not registered."
