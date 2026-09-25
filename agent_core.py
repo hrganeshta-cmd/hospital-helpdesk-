@@ -6,7 +6,7 @@ import traceback
 import requests
 from openai import OpenAI
 from bs4 import BeautifulSoup
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import uuid
 
 # ---------------------------------------------------------------------------
@@ -981,6 +981,10 @@ DOCTOR_ROSTER_TEXT = "; ".join(sorted(
 
 def build_system_prompt():
     _today_str = date.today().strftime("%A, %d %B %Y")   # e.g., "Tuesday, 07 April 2026"
+    # The model miscounts weekdays (it once took "Tuesday" to be a Sunday),
+    # so the next seven dates are listed for it to read instead.
+    _next_week = "; ".join(
+        (date.today() + timedelta(days=i)).strftime("%A %Y-%m-%d") for i in range(1, 8))
     return f"""
 You are {RECEPTIONIST_NAME}, a professional and empathetic hospital receptionist at
 the {HOSPITAL_NAME}.
@@ -988,6 +992,7 @@ Your role is to assist patients with booking appointments, checking existing
 appointments, and answering general hospital queries.
 
 Today's date is {_today_str}.
+The next seven days are: {_next_week}.
 Use this to resolve relative date expressions such as "tomorrow", "next Monday",
 or "this Friday" before passing any date to a tool.
 
@@ -1287,7 +1292,11 @@ class HospitalReceptionistAgent:
                         "properties": {
                             "day": {
                                 "type": "string",
-                                "description": "Weekday name in English (e.g. Monday) or a date in YYYY-MM-DD format.",
+                                "description": (
+                                    "Weekday name in English as the caller said it "
+                                    "(e.g. Tuesday). Give a YYYY-MM-DD date only when "
+                                    "the caller named a specific date."
+                                ),
                             },
                             "department": {
                                 "type": "string",
