@@ -33,6 +33,11 @@ VOICES = {lang: {**default, **VOICE_SETTINGS.get(lang, {})}
           for lang, default in _DEFAULT_VOICES.items()}
 SPEED = float(VOICE_SETTINGS.get("speed", 1.0))
 
+# Female voices that may be tried on the /voices comparison page. Only these
+# can be requested by name, so the public page cannot be used for any voice.
+SAMPLE_VOICES = ["sunidhi", "rupali", "aanya", "siya", "ishani", "avni", "sakshi", "maya"]
+_LANGUAGE_CODES = {"English": "en", "Hindi": "hi", "Marathi": "mr"}
+
 
 class TtsError(Exception):
     pass
@@ -91,9 +96,10 @@ _CACHE_MAX_ITEMS = 64
 _CACHEABLE_CHARS = 120
 
 
-def synthesize(text, language=None):
+def synthesize(text, language=None, voice_id=None):
     """MP3 bytes for text. language is English / Hindi / Marathi; when not
-    given it is detected from the text."""
+    given it is detected from the text. voice_id (one of SAMPLE_VOICES)
+    replaces the configured voice, for the comparison page."""
     text = (text or "").strip()
     if not text:
         raise TtsError("No text to speak.")
@@ -103,8 +109,12 @@ def synthesize(text, language=None):
         raise TtsError("SMALLEST_API_KEY is not set.")
     language = language if language in VOICES else agent_core.detect_language(text)
     voice = VOICES[language]
+    if voice_id:
+        if voice_id not in SAMPLE_VOICES:
+            raise TtsError("Unknown voice.")
+        voice = {**voice, "voice_id": voice_id, "language": _LANGUAGE_CODES[language]}
 
-    key = (language, text)
+    key = (language, voice["voice_id"], text)
     with _cache_lock:
         if key in _cache:
             _cache.move_to_end(key)

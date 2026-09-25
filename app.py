@@ -150,8 +150,9 @@ def text_to_speech():
     data = (request.get_json(silent=True) or {}) if request.method == "POST" else request.args
     text = (data.get("text") or "").strip()
     language = (data.get("language") or data.get("lang") or "").strip().capitalize() or None
+    voice_id = (data.get("voice") or "").strip().lower() or None
     try:
-        audio = tts.synthesize(text, language)
+        audio = tts.synthesize(text, language, voice_id)
     except tts.TtsError as e:
         print(f"--- TTS error: {e} ---", flush=True)
         return jsonify({"error": "Voice is not available right now."}), 502
@@ -169,6 +170,32 @@ VOICE_SAMPLES = [
     ("Marathi", "नमस्कार, रुग्णालय स्वागत कक्षात आपले स्वागत आहे. मी आपली काय मदत करू शकते?"),
     ("Marathi", "डॉ. नेहा कपाडिया सोमवारी उपलब्ध आहेत. त्यांची वेळ सकाळी ९ ते दुपारी १ पर्यंत आहे."),
 ]
+
+
+# The same three sentences for every voice, so voices can be compared.
+COMPARE_SENTENCES = [
+    ("English", "Hello, welcome to the Hospital Reception Desk. Dr. Neha Kapadia is available on Monday from 9 AM to 1 PM."),
+    ("Hindi", "नमस्ते, अस्पताल रिसेप्शन डेस्क में आपका स्वागत है। डॉ. नेहा कपाडिया सोमवार को सुबह 9 बजे से दोपहर 1 बजे तक उपलब्ध हैं।"),
+    ("Marathi", "नमस्कार, रुग्णालय स्वागत कक्षात आपले स्वागत आहे. डॉ. नेहा कपाडिया सोमवारी सकाळी ९ ते दुपारी १ पर्यंत उपलब्ध आहेत."),
+]
+
+
+@app.get("/voices/compare")
+def voices_compare():
+    blocks = []
+    for voice in tts.SAMPLE_VOICES:
+        rows = "".join(
+            f"<p><b>{lang}</b><br><audio controls preload='none' "
+            f"src='/api/tts?voice={voice}&amp;lang={lang}&amp;text={quote(text)}'></audio></p>"
+            for lang, text in COMPARE_SENTENCES)
+        blocks.append(f"<section style='border:1px solid #ccc;border-radius:8px;padding:8px 12px;margin:12px 0'>"
+                      f"<h2 style='margin:4px 0'>{escape(voice)}</h2>{rows}</section>")
+    return (f"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+            f"<title>Compare voices</title><body style='font-family:sans-serif;max-width:640px;"
+            f"margin:auto;padding:16px'><h1>One voice for all three languages</h1>"
+            f"<p>Each voice says the same sentence in English, Hindi and Marathi. "
+            f"A player that does not play means that voice cannot speak that language.</p>"
+            f"{''.join(blocks)}</body>")
 
 
 @app.get("/voices")
