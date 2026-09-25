@@ -550,8 +550,12 @@ _NOT_BOOKING = ("cancel", "कैंसल", "रद्द", "status", "check my
 
 
 def wants_to_book(text):
-    """The caller asks to book an appointment (not to cancel or check one)."""
+    """The caller asks to book an appointment (not to cancel or check one).
+    A sentence carrying a booking ID is about an existing booking."""
     s = _norm(text)
+    if ("id" in re.findall(r"[a-z]+", s) or any(w in s for w in ("आईडी", "आयडी", "आय डी"))
+            or "suh" in s or re.search(r"s\s*u\s*h\s*\d", s)):
+        return False
     return any(w in s for w in _BOOK_WORDS) and not any(w in s for w in _NOT_BOOKING)
 
 
@@ -561,8 +565,12 @@ _QUESTION_WORDS = ("where", "what", "when", "how", "which", "who", "why", "is th
 
 
 def looks_like_question(text):
+    """A question: a '?', or a question word (whole English words, so that
+    'whose' or 'show' do not count)."""
     s = _norm(text)
-    return "?" in s or any(w in s for w in _QUESTION_WORDS)
+    words = set(re.findall(r"[a-z]+", s))
+    return ("?" in s or any(w in words for w in _QUESTION_WORDS if w.isascii() and " " not in w)
+            or any(w in s for w in _QUESTION_WORDS if " " in w or not w.isascii()))
 
 
 def wants_to_stop(text):
@@ -953,6 +961,8 @@ class BookingFlow:
 
     def _collect(self, text, language):
         field = self.expect()
+        if field in ("name", "reason") and looks_like_question(text):
+            return "", "question"               # answered by the model, then we carry on
         ok, message = self._take(field, text, language)
         if ok is None:
             # Details given out of order: a mobile number or a doctor said
