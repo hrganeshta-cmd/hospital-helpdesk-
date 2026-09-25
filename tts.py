@@ -16,12 +16,15 @@ import requests
 
 import agent_core
 
-SMALLEST_URL = "https://api.smallest.ai/waves/v1/tts"
+# India region: Hindi and Marathi are not enabled on the US cluster, which
+# is where requests from the (US-hosted) Railway server are routed by default.
+SMALLEST_URL = os.environ.get("SMALLEST_TTS_URL", "https://api.india.smallest.ai/waves/v1/tts")
 MAX_TEXT_CHARS = 1000          # longer requests are refused (cost guard)
 CHUNK_CHARS = 240              # the API accepts at most 250 characters per request
 
 _DEFAULT_VOICES = {
-    "English": {"voice_id": "meher",   "language": "en", "model": "lightning_v3.1"},
+    # One Indian voice for English and Hindi, so the receptionist keeps one voice.
+    "English": {"voice_id": "sunidhi", "language": "en", "model": "lightning_v3.1"},
     "Hindi":   {"voice_id": "sunidhi", "language": "hi", "model": "lightning_v3.1"},
     "Marathi": {"voice_id": "rupali",  "language": "mr", "model": "lightning_v3.1"},
 }
