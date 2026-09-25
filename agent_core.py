@@ -778,6 +778,11 @@ def list_available_slots(doctor_name: str, date_str: str, language: str = "Engli
     date_str is YYYY-MM-DD, or the caller's day words (see resolve_day).
     """
     print(f"--- System: Listing slots for '{doctor_name}' on {date_str} ---")
+    # The model sometimes asks for "all departments" or "any doctor" here;
+    # answer with the whole day's list instead of "no doctor found".
+    generic = {"ALL", "ANY", "DEPARTMENT", "DEPARTMENTS", "DOCTOR", "DOCTORS", "AVAILABLE", "DR"}
+    if set(re.findall(r"[A-Z]+", doctor_name.upper())) <= generic:
+        return get_doctors_on_day(date_str, "", language)
     _, resolved = resolve_day(date_str)
     if resolved is None:
         return (
