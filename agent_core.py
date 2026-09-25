@@ -1229,6 +1229,15 @@ _ROMAN_MARATHI_WORDS = {
     "budhvari", "guruvari", "shukravari", "shanivari", "ravivari", "udya",
     "kiti", "yetil", "vajta", "vajata", "bheta", "bhetel", "bhetatil",
 }
+# Everyday English words. Names ("Dr Harish Menon") and words shared with
+# romanised Hindi ("appointment", "book") are left out on purpose.
+_ENGLISH_WORDS = {
+    "the", "is", "are", "am", "was", "what", "which", "who", "when", "where",
+    "how", "why", "can", "could", "would", "will", "do", "does", "i", "my",
+    "me", "you", "your", "an", "of", "for", "to", "on", "in", "at", "there",
+    "this", "that", "it", "please", "want", "need", "have", "has", "with",
+    "from", "and", "or", "yes", "no", "thank", "thanks", "tell", "give",
+}
 # Words used in both Hindi and Marathi, so they decide neither.
 _ROMAN_SHARED = {"nahi", "ho", "ka"}
 
@@ -1238,9 +1247,9 @@ def detect_language(text, previous="English"):
     a Marathi-only word or letter, otherwise Hindi. Text in English letters
     is Hindi or Marathi when it has at least two of that language's common
     words (so a single "ko" or "la" in English does not switch language),
-    and English when it is a full sentence with none of them. Short or
-    unclear answers ("Ramesh Patil", "haan", a phone number) keep the
-    language the call was already using."""
+    and English when it has at least two everyday English words. Anything
+    else ("Ramesh Patil", "Dr Harish Menon", "haan", a phone number) keeps
+    the language the call was already using."""
     if re.search(r"[\u0900-\u097F]", text):
         return "Marathi" if any(m in text for m in _MARATHI_MARKERS) else "Hindi"
     words = re.findall(r"[a-z]+", text.lower())
@@ -1248,9 +1257,23 @@ def detect_language(text, previous="English"):
     marathi = sum(1 for w in words if w in _ROMAN_MARATHI_WORDS and w not in _ROMAN_SHARED)
     if max(hindi, marathi) >= 2:
         return "Marathi" if marathi >= hindi else "Hindi"
-    if len(words) >= 3 and max(hindi, marathi) == 0:
+    if sum(1 for w in words if w in _ENGLISH_WORDS) >= 2:
         return "English"
     return previous
+
+
+# Ways a caller says yes, in English, Hindi and Marathi (either script).
+_YES_WORDS = {
+    "yes", "yeah", "yep", "ok", "okay", "sure", "confirm", "confirmed", "correct",
+    "right", "haan", "han", "ha", "haa", "ji", "theek", "thik", "ho", "hoy",
+    "hoye", "barobar", "chalel", "हाँ", "हां", "हा", "जी", "ठीक", "हो", "होय",
+    "बरोबर", "चालेल", "सही",
+}
+
+def is_confirmation(text):
+    """True when the caller's message says yes."""
+    words = re.findall(r"[a-z]+|[\u0900-\u097F]+", text.lower())
+    return any(w in _YES_WORDS for w in words)
 
 
 class HospitalReceptionistAgent:
@@ -1542,6 +1565,14 @@ class HospitalReceptionistAgent:
                         fn_result = check_appointment_status(
                             patient_id=fn_args.get("patient_id")
                         )
+                    elif fn_name == "book_appointment" and not is_confirmation(user_input):
+                        # The model once booked straight after hearing the
+                        # doctor's name. Booking needs the caller's yes.
+                        print("--- System: booking held until the caller confirms ---")
+                        fn_result = (
+                            "Not booked yet. Read all six details back to the caller "
+                            "and ask for a yes or no. Call book_appointment only after "
+                            "the caller says yes.")
                     elif fn_name == "book_appointment":
                         fn_result = book_appointment(
                             patient_name=fn_args.get("patient_name"),
