@@ -1128,7 +1128,9 @@ COMMUNICATION RULES:
 5. Do not provide medical advice or diagnosis under any circumstance.
 6. Reply in the language named in the "Reply language" note that comes
    with each caller message — English, Hindi, or Marathi — and only in that
-   language.
+   language. Hindi and Marathi replies are always written in Devanagari,
+   even when the caller's words arrive in English letters (the phone
+   sometimes writes Hindi or Marathi speech that way).
 7. The caller was already welcomed when the call started. Never greet or
    welcome them again; answer the question directly.
 8. Never name the doctors on a day, or give any doctor's days or timings,
@@ -1207,12 +1209,48 @@ Doctors and departments (days and timings come only from the tools):
 _MARATHI_MARKERS = ("आहे", "कोण", "काय", "च्या", "चे ", "ची ", "मध्ये", "ळ",
                     "कधी", "नाही", "तुम्ही", "आम्ही", "पाहिजे", "हवे", "वारी")
 
-def detect_language(text):
-    """English unless the text has Devanagari; then Marathi when it carries
-    a Marathi-only word or letter, otherwise Hindi."""
-    if not re.search(r"[ऀ-ॿ]", text):
+# Hindi and Marathi typed or transcribed in English letters ("Somvar ko
+# kidney ke doctor kaun hain?"). The phone's speech recogniser writes Hindi
+# and Marathi speech like this when it listens in English. Only words that
+# are not ordinary English words are listed.
+_ROMAN_HINDI_WORDS = {
+    "hai", "hain", "hoon", "hun", "kya", "kaun", "kab", "kahan", "kaise",
+    "kyun", "mujhe", "muje", "mera", "meri", "mere", "aap", "aapka", "aapko",
+    "hum", "humein", "karna", "karni", "karo", "karein", "chahiye", "chahie",
+    "ko", "ke", "ka", "ki", "se", "tak", "nahin", "nahi", "haan", "ji",
+    "dijiye", "batao", "bataiye", "milenge", "milega", "wale", "wala", "kitne",
+}
+_ROMAN_MARATHI_WORDS = {
+    "aahe", "ahe", "aahet", "ahet", "aahes", "kon", "kay", "kasa", "kashi",
+    "kadhi", "kuthe", "mala", "mla", "amhi", "tumhi", "tumhala", "pahije",
+    "havi", "hava", "karaychi", "karaycha", "karayche", "sanga",
+    "sangal", "dya", "ahat", "aahat", "cha", "chi", "che", "chya", "la",
+    "madhe", "madhye", "hoil", "nahi", "ho", "somvari", "mangalvari",
+    "budhvari", "guruvari", "shukravari", "shanivari", "ravivari", "udya",
+    "kiti", "yetil", "vajta", "vajata", "bheta", "bhetel", "bhetatil",
+}
+# Words used in both Hindi and Marathi, so they decide neither.
+_ROMAN_SHARED = {"nahi", "ho", "ka"}
+
+
+def detect_language(text, previous="English"):
+    """English, Hindi or Marathi. Devanagari text is Marathi when it carries
+    a Marathi-only word or letter, otherwise Hindi. Text in English letters
+    is Hindi or Marathi when it has at least two of that language's common
+    words (so a single "ko" or "la" in English does not switch language),
+    and English when it is a full sentence with none of them. Short or
+    unclear answers ("Ramesh Patil", "haan", a phone number) keep the
+    language the call was already using."""
+    if re.search(r"[\u0900-\u097F]", text):
+        return "Marathi" if any(m in text for m in _MARATHI_MARKERS) else "Hindi"
+    words = re.findall(r"[a-z]+", text.lower())
+    hindi = sum(1 for w in words if w in _ROMAN_HINDI_WORDS and w not in _ROMAN_SHARED)
+    marathi = sum(1 for w in words if w in _ROMAN_MARATHI_WORDS and w not in _ROMAN_SHARED)
+    if max(hindi, marathi) >= 2:
+        return "Marathi" if marathi >= hindi else "Hindi"
+    if len(words) >= 3 and max(hindi, marathi) == 0:
         return "English"
-    return "Marathi" if any(m in text for m in _MARATHI_MARKERS) else "Hindi"
+    return previous
 
 
 class HospitalReceptionistAgent:
@@ -1227,6 +1265,7 @@ class HospitalReceptionistAgent:
         self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.model  = model
         self.conversation_history = [{"role": "system", "content": build_system_prompt()}]
+        self.language = "English"   # the call's language so far; see detect_language
         self.tools  = [
             {
                 "type": "function",
@@ -1470,7 +1509,7 @@ class HospitalReceptionistAgent:
         self.conversation_history.append({"role": "user", "content": user_input})
         # Stated fresh each turn and never stored, so the reply language
         # follows the caller rather than the prompt's Hindi/Marathi examples.
-        language = detect_language(user_input)
+        language = self.language = detect_language(user_input, self.language)
         said_day = weekday_in_text(user_input)
 
         def caller_day(model_day):
